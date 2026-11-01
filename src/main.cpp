@@ -1,4 +1,4 @@
-// LitePainter - Tahap 3: layer + padding seam + headlight
+// LitePainter - Tahap 4: kanal PBR (Base Color / Roughness / Metallic) + preview PBR
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 
@@ -17,6 +17,7 @@
 #include <stb_image_write.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -40,22 +41,78 @@ uniform mat4 uMVP;
 out vec3 vP; out vec3 vN; out vec2 vUV;
 void main(){ vP = aPos; vN = aNrm; vUV = aUV; gl_Position = uMVP * vec4(aPos,1.0); }
 )";
-// headlight: terang dari sudut pandang kamera
+
+// uView: 0 = Base Color, 1 = PBR, 2 = Roughness, 3 = Metallic
 static const char* kMeshFS = R"(#version 330 core
 in vec3 vP; in vec3 vN; in vec2 vUV;
-uniform vec3 uEye; uniform sampler2D uTex;
+uniform vec3 uEye; uniform vec3 uLight;
+uniform sampler2D uTex; uniform sampler2D uTexP;
+uniform int uView;
 out vec4 frag;
+const float PI = 3.14159265;
+
+// lingkungan prosedural sederhana (langit + tanah + matahari), makin kasar makin blur
+vec3 envMap(vec3 d, float r){
+  float y = clamp(d.y, -1.0, 1.0);
+  vec3 hor = vec3(0.80, 0.82, 0.86);
+  vec3 top = vec3(0.35, 0.55, 0.95);
+  vec3 bot = vec3(0.10, 0.09, 0.08);
+  vec3 c = (y > 0.0) ? mix(hor, top, sqrt(y)) : mix(hor, bot, sqrt(-y));
+  float s = pow(max(dot(d, normalize(vec3(0.4, 0.8, 0.3))), 0.0), mix(400.0, 6.0, r));
+  c += vec3(1.0, 0.93, 0.8) * s * mix(4.0, 0.4, r);
+  return mix(c, vec3(0.42, 0.45, 0.5), r * r);
+}
+
 void main(){
   vec3 n = normalize(vN);
   vec3 v = normalize(uEye - vP);
-  if (dot(n, v) < 0.0) n = -n;                 // lighting dua sisi
-  float d = max(dot(n, v), 0.0);
-  float h = 0.5 + 0.5 * n.y;
-  float lit = 0.3 + 0.5 * d + 0.2 * h;
+  if (dot(n, v) < 0.0) n = -n;
   vec3 base = texture(uTex, vUV).rgb;
-  frag = vec4(base * lit, 1.0);
+  vec2 rm = texture(uTexP, vUV).rg;
+
+  if (uView == 0) {
+    float d = max(dot(n, v), 0.0);
+    float sky = 0.5 + 0.5 * n.y;
+    frag = vec4(base * (0.3 + 0.5 * d + 0.2 * sky), 1.0);
+    return;
+  }
+  if (uView >= 2) {
+    float val = (uView == 2) ? rm.x : rm.y;
+    float d = max(dot(n, v), 0.0);
+    frag = vec4(vec3(val) * (0.35 + 0.65 * d), 1.0);
+    return;
+  }
+
+  vec3 albedo = pow(base, vec3(2.2));
+  float rough = clamp(rm.x, 0.05, 1.0);
+  float metal = clamp(rm.y, 0.0, 1.0);
+  vec3 F0 = mix(vec3(0.04), albedo, metal);
+  float NdV = max(dot(n, v), 1e-3);
+  vec3 l = normalize(uLight);
+  vec3 hv = normalize(l + v);
+  float NdL = max(dot(n, l), 0.0);
+  float NdH = max(dot(n, hv), 0.0);
+  float VdH = max(dot(v, hv), 0.0);
+  float a = rough * rough; float a2 = a * a;
+  float dd = NdH * NdH * (a2 - 1.0) + 1.0;
+  float D = a2 / (PI * dd * dd);
+  float k = (rough + 1.0) * (rough + 1.0) / 8.0;
+  float G = (NdL / (NdL * (1.0 - k) + k)) * (NdV / (NdV * (1.0 - k) + k));
+  vec3 F = F0 + (1.0 - F0) * pow(1.0 - VdH, 5.0);
+  vec3 spec = D * G * F / (4.0 * NdL * NdV + 1e-4);
+  vec3 kd = (1.0 - F) * (1.0 - metal);
+  vec3 direct = (kd * albedo / PI + spec) * NdL * 3.0;
+
+  vec3 rv = reflect(-v, n);
+  vec3 Fa = F0 + (max(vec3(1.0 - rough), F0) - F0) * pow(1.0 - NdV, 5.0);
+  vec3 amb = (1.0 - Fa) * (1.0 - metal) * albedo * envMap(n, 1.0) * 0.8 + envMap(rv, rough) * Fa;
+
+  vec3 col = direct + amb;
+  col = col / (1.0 + col);
+  frag = vec4(pow(col, vec3(1.0 / 2.2)), 1.0);
 }
 )";
+
 static const char* kLineVS = R"(#version 330 core
 layout(location=0) in vec3 aPos;
 uniform mat4 uMVP; uniform vec3 uOrigin; uniform float uScale;
@@ -65,7 +122,10 @@ static const char* kLineFS = R"(#version 330 core
 uniform vec3 uColor; out vec4 frag;
 void main(){ frag = vec4(uColor,1.0); }
 )";
-// Paint pass: mesh digambar di ruang UV, jarak diukur di ruang 3D. Output premultiplied.
+
+// Paint pass (MRT): mesh digambar di ruang UV. Output premultiplied.
+//   outColor = (rgb*a, a)
+//   outPbr   = (rough*a, a, metal*a, a)   -> R,G = roughness(+alpha), B,A = metallic(+alpha)
 static const char* kPaintVS = R"(#version 330 core
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNrm;
@@ -77,31 +137,35 @@ static const char* kPaintFS = R"(#version 330 core
 in vec3 vP; in vec3 vN;
 uniform vec3 uHit; uniform vec3 uHitN; uniform vec3 uColor;
 uniform float uRadius; uniform float uHardness; uniform float uOpacity;
-out vec4 frag;
+uniform float uRough; uniform float uMetal;
+layout(location=0) out vec4 outColor;
+layout(location=1) out vec4 outPbr;
 void main(){
   float d = distance(vP, uHit) / uRadius;
   if (d >= 1.0) discard;
   if (dot(normalize(vN), uHitN) < 0.1) discard;
   float a = (1.0 - smoothstep(uHardness, 1.0, d)) * uOpacity;
-  frag = vec4(uColor * a, a);
+  outColor = vec4(uColor * a, a);
+  outPbr = vec4(uRough * a, a, uMetal * a, a);
 }
 )";
 static const char* kMaskFS = R"(#version 330 core
 out vec4 frag;
 void main(){ frag = vec4(1.0); }
 )";
-// Fullscreen triangle (tanpa vertex buffer)
 static const char* kFullVS = R"(#version 330 core
 void main(){
   vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
   gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
 }
 )";
-// Komposit satu layer di atas hasil sebelumnya
+// Komposit satu layer. Hasil: outC = base color, outP = (roughness, metallic, 0, 1)
 static const char* kCompFS = R"(#version 330 core
 uniform sampler2D uDst; uniform sampler2D uLayer;
+uniform sampler2D uDstP; uniform sampler2D uLayerP;
 uniform float uOpacity; uniform int uMode;
-out vec4 frag;
+layout(location=0) out vec4 outC;
+layout(location=1) out vec4 outP;
 vec3 blendFn(vec3 b, vec3 s){
   if (uMode == 1) return b * s;
   if (uMode == 2) return 1.0 - (1.0 - b) * (1.0 - s);
@@ -115,33 +179,44 @@ void main(){
   vec4 L = texelFetch(uLayer, c, 0);
   float a = L.a * uOpacity;
   vec3 s = (L.a > 0.0001) ? (L.rgb / L.a) : vec3(0.0);
-  vec3 res = mix(dst.rgb, blendFn(dst.rgb, s), a);
-  frag = vec4(res, 1.0);
+  outC = vec4(mix(dst.rgb, blendFn(dst.rgb, s), a), 1.0);
+
+  vec4 dp = texelFetch(uDstP, c, 0);
+  vec4 P = texelFetch(uLayerP, c, 0);
+  float ra = P.g * uOpacity;
+  float rv = (P.g > 0.0001) ? (P.r / P.g) : 0.0;
+  float ma = P.a * uOpacity;
+  float mv = (P.a > 0.0001) ? (P.b / P.a) : 0.0;
+  outP = vec4(mix(dp.r, rv, ra), mix(dp.g, mv, ma), 0.0, 1.0);
 }
 )";
-// Padding seam: stage 0 = tandai area UV pakai mask, stage 1 = lebarkan 1 piksel
+// Padding seam untuk kedua texture sekaligus
 static const char* kDilFS = R"(#version 330 core
-uniform sampler2D uSrc; uniform sampler2D uMask; uniform int uStage;
-out vec4 frag;
+uniform sampler2D uSrc; uniform sampler2D uMask; uniform sampler2D uSrcP; uniform int uStage;
+layout(location=0) out vec4 outC;
+layout(location=1) out vec4 outP;
 void main(){
   ivec2 c = ivec2(gl_FragCoord.xy);
   vec4 s = texelFetch(uSrc, c, 0);
+  vec4 sp = texelFetch(uSrcP, c, 0);
   if (uStage == 0) {
-    float m = texelFetch(uMask, c, 0).r;
-    frag = vec4(s.rgb, m > 0.5 ? 1.0 : 0.0);
+    float m = texelFetch(uMask, c, 0).r > 0.5 ? 1.0 : 0.0;
+    outC = vec4(s.rgb, m);
+    outP = vec4(sp.rg, 0.0, m);
     return;
   }
-  if (s.a > 0.5) { frag = s; return; }
+  if (s.a > 0.5) { outC = s; outP = sp; return; }
   ivec2 sz = textureSize(uSrc, 0);
-  vec3 acc = vec3(0.0); float n = 0.0;
+  vec3 acc = vec3(0.0); vec2 accp = vec2(0.0); float n = 0.0;
   for (int y = -1; y <= 1; y++) {
     for (int x = -1; x <= 1; x++) {
       ivec2 p = clamp(c + ivec2(x, y), ivec2(0), sz - ivec2(1));
       vec4 t = texelFetch(uSrc, p, 0);
-      if (t.a > 0.5) { acc += t.rgb; n += 1.0; }
+      if (t.a > 0.5) { acc += t.rgb; accp += texelFetch(uSrcP, p, 0).rg; n += 1.0; }
     }
   }
-  frag = (n > 0.0) ? vec4(acc / n, 1.0) : s;
+  if (n > 0.0) { outC = vec4(acc / n, 1.0); outP = vec4(accp / n, 0.0, 1.0); }
+  else { outC = s; outP = sp; }
 }
 )";
 
@@ -157,6 +232,8 @@ static GLuint makeProgram(const char* vs, const char* fs) {
     GLuint v = compile(GL_VERTEX_SHADER, vs), f = compile(GL_FRAGMENT_SHADER, fs);
     GLuint p = glCreateProgram();
     glAttachShader(p, v); glAttachShader(p, f); glLinkProgram(p);
+    GLint ok = 0; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) { char log[1024]; glGetProgramInfoLog(p, 1024, nullptr, log); std::fprintf(stderr, "Link error: %s\n", log); }
     glDeleteShader(v); glDeleteShader(f);
     return p;
 }
@@ -283,67 +360,94 @@ static GLuint makeFbo(GLuint tex) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     return f;
 }
+static GLuint makeFbo2(GLuint t0, GLuint t1) {   // 2 attachment (MRT)
+    GLuint f; glGenFramebuffers(1, &f);
+    glBindFramebuffer(GL_FRAMEBUFFER, f);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t0, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, t1, 0);
+    GLenum bufs[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+    glDrawBuffers(2, bufs);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    return f;
+}
 
 // ================================================================ layers + canvas
 struct Layer {
     int id = 0;
     std::string name;
-    GLuint tex = 0, fbo = 0;       // RGBA8, premultiplied alpha
+    GLuint tex = 0;    // base color RGBA8, premultiplied
+    GLuint texP = 0;   // (rough*a, a, metal*a, a)
+    GLuint fbo = 0;    // MRT: attachment0 = tex, attachment1 = texP
     float opacity = 1.0f;
-    int blend = 0;                 // 0 Normal,1 Multiply,2 Screen,3 Overlay,4 Add
+    int blend = 0;     // 0 Normal,1 Multiply,2 Screen,3 Overlay,4 Add (berlaku untuk Base Color)
     bool visible = true;
 };
-struct UndoEntry { int layerId = 0; std::vector<unsigned char> px; };
+struct UndoEntry { int layerId = 0; std::vector<unsigned char> px, pxP; };
 
 struct Canvas {
-    static const size_t kMaxLayers = 8;
+    static constexpr size_t kMaxLayers = 6;
     int size = 0, active = 0, nextId = 1, cur = 0;
     bool dirty = false, maskValid = false;
     std::vector<Layer> layers;
-    GLuint comp[2] = {0, 0}, compFbo[2] = {0, 0};
-    GLuint disp = 0, dispFbo = 0;      // hasil akhir (dengan mipmap) untuk ditampilkan
-    GLuint mask = 0, maskFbo = 0;      // area yang tertutup UV
+    GLuint compC[2] = {0, 0}, compP[2] = {0, 0}, compFbo[2] = {0, 0};
+    GLuint dispC = 0, dispP = 0, dispCFbo = 0, dispPFbo = 0;
+    GLuint mask = 0, maskFbo = 0;
     GLuint compProg = 0, dilProg = 0, maskProg = 0, emptyVao = 0;
     std::vector<UndoEntry> undoS, redoS;
 
-    size_t maxStates() const { return size >= 2048 ? 10 : (size >= 1024 ? 25 : 40); }
+    size_t maxStates() const { return size >= 2048 ? 8 : (size >= 1024 ? 20 : 40); }
 
     void freeLayer(Layer& L) {
         if (L.fbo) glDeleteFramebuffers(1, &L.fbo);
         if (L.tex) glDeleteTextures(1, &L.tex);
-        L.fbo = L.tex = 0;
+        if (L.texP) glDeleteTextures(1, &L.texP);
+        L.fbo = L.tex = L.texP = 0;
     }
     void destroy() {
         for (auto& L : layers) freeLayer(L);
         layers.clear();
         for (int i = 0; i < 2; i++) {
             if (compFbo[i]) glDeleteFramebuffers(1, &compFbo[i]);
-            if (comp[i]) glDeleteTextures(1, &comp[i]);
-            compFbo[i] = comp[i] = 0;
+            if (compC[i]) glDeleteTextures(1, &compC[i]);
+            if (compP[i]) glDeleteTextures(1, &compP[i]);
+            compFbo[i] = compC[i] = compP[i] = 0;
         }
-        if (dispFbo) glDeleteFramebuffers(1, &dispFbo);
-        if (disp) glDeleteTextures(1, &disp);
+        if (dispCFbo) glDeleteFramebuffers(1, &dispCFbo);
+        if (dispPFbo) glDeleteFramebuffers(1, &dispPFbo);
+        if (dispC) glDeleteTextures(1, &dispC);
+        if (dispP) glDeleteTextures(1, &dispP);
         if (maskFbo) glDeleteFramebuffers(1, &maskFbo);
         if (mask) glDeleteTextures(1, &mask);
-        dispFbo = disp = maskFbo = mask = 0;
+        dispCFbo = dispPFbo = dispC = dispP = maskFbo = mask = 0;
         undoS.clear(); redoS.clear();
         maskValid = false;
     }
     void create(int sz) {
         destroy();
         size = sz; active = 0;
-        for (int i = 0; i < 2; i++) { comp[i] = makeTex(sz, GL_RGBA8, GL_RGBA, false); compFbo[i] = makeFbo(comp[i]); }
-        disp = makeTex(sz, GL_RGBA8, GL_RGBA, true); dispFbo = makeFbo(disp);
+        for (int i = 0; i < 2; i++) {
+            compC[i] = makeTex(sz, GL_RGBA8, GL_RGBA, false);
+            compP[i] = makeTex(sz, GL_RGBA8, GL_RGBA, false);
+            compFbo[i] = makeFbo2(compC[i], compP[i]);
+        }
+        dispC = makeTex(sz, GL_RGBA8, GL_RGBA, true); dispCFbo = makeFbo(dispC);
+        dispP = makeTex(sz, GL_RGBA8, GL_RGBA, true); dispPFbo = makeFbo(dispP);
         mask = makeTex(sz, GL_R8, GL_RED, false); maskFbo = makeFbo(mask);
         addLayer();
         dirty = true;
     }
-    void clearLayer(Layer& L, float r, float g, float b, float a) {
+    // Isi/hapus hanya kanal yang aktif (c = color, r = roughness, m = metallic)
+    void clearChannels(Layer& L, bool c, bool r, bool m, const float col[4], const float pbr[4]) {
         glBindFramebuffer(GL_FRAMEBUFFER, L.fbo);
         glViewport(0, 0, size, size);
-        glDisable(GL_BLEND);
-        glClearColor(r, g, b, a);
-        glClear(GL_COLOR_BUFFER_BIT);
+        glDisable(GL_BLEND); glDisable(GL_SCISSOR_TEST);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        if (c) glClearBufferfv(GL_COLOR, 0, col);
+        if (r || m) {
+            glColorMaski(1, (GLboolean)r, (GLboolean)r, (GLboolean)m, (GLboolean)m);
+            glClearBufferfv(GL_COLOR, 1, pbr);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        }
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         dirty = true;
     }
@@ -353,8 +457,10 @@ struct Canvas {
         L.id = nextId++;
         L.name = "Layer " + std::to_string(L.id);
         L.tex = makeTex(size, GL_RGBA8, GL_RGBA, false);
-        L.fbo = makeFbo(L.tex);
-        clearLayer(L, 0, 0, 0, 0);
+        L.texP = makeTex(size, GL_RGBA8, GL_RGBA, false);
+        L.fbo = makeFbo2(L.tex, L.texP);
+        const float z[4] = {0, 0, 0, 0};
+        clearChannels(L, true, true, true, z, z);
         int pos = layers.empty() ? 0 : active + 1;
         layers.insert(layers.begin() + pos, L);
         active = pos;
@@ -367,7 +473,7 @@ struct Canvas {
         active = std::min(active, (int)layers.size() - 1);
         dirty = true;
     }
-    void moveActive(int dir) {   // +1 = naik (ke atas), -1 = turun
+    void moveActive(int dir) {   // +1 = naik, -1 = turun
         int j = active + dir;
         if (j < 0 || j >= (int)layers.size()) return;
         std::swap(layers[active], layers[j]);
@@ -377,20 +483,23 @@ struct Canvas {
         for (auto& L : layers) if (L.id == id) return &L;
         return nullptr;
     }
-    void readLayer(const Layer& L, std::vector<unsigned char>& out) {
+    void readAtt(const Layer& L, int att, std::vector<unsigned char>& out) {
         out.resize((size_t)size * size * 4);
         glBindFramebuffer(GL_FRAMEBUFFER, L.fbo);
+        glReadBuffer((GLenum)(GL_COLOR_ATTACHMENT0 + att));
         glReadPixels(0, 0, size, size, GL_RGBA, GL_UNSIGNED_BYTE, out.data());
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
-    void writeLayer(const Layer& L, const std::vector<unsigned char>& in) {
-        glBindTexture(GL_TEXTURE_2D, L.tex);
+    void writeTex(GLuint t, const std::vector<unsigned char>& in) {
+        glBindTexture(GL_TEXTURE_2D, t);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, size, size, GL_RGBA, GL_UNSIGNED_BYTE, in.data());
         dirty = true;
     }
     void pushUndo() {   // snapshot layer aktif
         UndoEntry e; e.layerId = layers[active].id;
-        readLayer(layers[active], e.px);
+        readAtt(layers[active], 0, e.px);
+        readAtt(layers[active], 1, e.pxP);
         undoS.push_back(std::move(e));
         redoS.clear();
         if (undoS.size() > maxStates()) undoS.erase(undoS.begin());
@@ -400,9 +509,10 @@ struct Canvas {
             UndoEntry e = std::move(undoS.back()); undoS.pop_back();
             Layer* L = findLayer(e.layerId);
             if (!L) continue;
-            UndoEntry r; r.layerId = e.layerId; readLayer(*L, r.px);
+            UndoEntry r; r.layerId = e.layerId;
+            readAtt(*L, 0, r.px); readAtt(*L, 1, r.pxP);
             redoS.push_back(std::move(r));
-            writeLayer(*L, e.px);
+            writeTex(L->tex, e.px); writeTex(L->texP, e.pxP);
             return;
         }
     }
@@ -411,9 +521,10 @@ struct Canvas {
             UndoEntry e = std::move(redoS.back()); redoS.pop_back();
             Layer* L = findLayer(e.layerId);
             if (!L) continue;
-            UndoEntry r; r.layerId = e.layerId; readLayer(*L, r.px);
+            UndoEntry r; r.layerId = e.layerId;
+            readAtt(*L, 0, r.px); readAtt(*L, 1, r.pxP);
             undoS.push_back(std::move(r));
-            writeLayer(*L, e.px);
+            writeTex(L->tex, e.px); writeTex(L->texP, e.pxP);
             return;
         }
     }
@@ -422,6 +533,7 @@ struct Canvas {
         glBindFramebuffer(GL_FRAMEBUFFER, maskFbo);
         glViewport(0, 0, size, size);
         glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glClearColor(0, 0, 0, 0);
         glClear(GL_COLOR_BUFFER_BIT);
         glUseProgram(maskProg);
@@ -429,26 +541,33 @@ struct Canvas {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         maskValid = true; dirty = true;
     }
-    // Gabungkan semua layer -> disp. dilate = isi area di luar UV (padding seam)
-    void compose(const float base[3], bool dilate) {
-        glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE);
+    // Gabungkan semua layer -> dispC / dispP.  dilate = isi area di luar UV (padding seam)
+    void compose(const float base[3], float baseRough, float baseMetal, bool dilate) {
+        glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glViewport(0, 0, size, size);
         glBindVertexArray(emptyVao);
         cur = 0;
         glBindFramebuffer(GL_FRAMEBUFFER, compFbo[cur]);
-        glClearColor(base[0], base[1], base[2], 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
+        const float c0[4] = {base[0], base[1], base[2], 1.0f};
+        const float c1[4] = {baseRough, baseMetal, 0.0f, 1.0f};
+        glClearBufferfv(GL_COLOR, 0, c0);
+        glClearBufferfv(GL_COLOR, 1, c1);
 
         glUseProgram(compProg);
         glUniform1i(glGetUniformLocation(compProg, "uDst"), 0);
         glUniform1i(glGetUniformLocation(compProg, "uLayer"), 1);
+        glUniform1i(glGetUniformLocation(compProg, "uDstP"), 2);
+        glUniform1i(glGetUniformLocation(compProg, "uLayerP"), 3);
         GLint locOp = glGetUniformLocation(compProg, "uOpacity");
         GLint locMode = glGetUniformLocation(compProg, "uMode");
         for (auto& L : layers) {
             if (!L.visible || L.opacity <= 0.0f) continue;
             glBindFramebuffer(GL_FRAMEBUFFER, compFbo[1 - cur]);
-            glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, comp[cur]);
+            glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, compC[cur]);
             glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, L.tex);
+            glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, compP[cur]);
+            glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, L.texP);
             glUniform1f(locOp, L.opacity);
             glUniform1i(locMode, L.blend);
             glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -459,36 +578,51 @@ struct Canvas {
             glUseProgram(dilProg);
             glUniform1i(glGetUniformLocation(dilProg, "uSrc"), 0);
             glUniform1i(glGetUniformLocation(dilProg, "uMask"), 1);
+            glUniform1i(glGetUniformLocation(dilProg, "uSrcP"), 2);
             GLint locStage = glGetUniformLocation(dilProg, "uStage");
             glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, mask);
             int passes = std::max(2, size / 256);
             for (int i = -1; i < passes; i++) {
                 glUniform1i(locStage, i < 0 ? 0 : 1);
                 glBindFramebuffer(GL_FRAMEBUFFER, compFbo[1 - cur]);
-                glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, comp[cur]);
+                glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, compC[cur]);
+                glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, compP[cur]);
                 glDrawArrays(GL_TRIANGLES, 0, 3);
                 cur = 1 - cur;
             }
         }
 
+        // salin ke texture tampilan (punya mipmap)
         glBindFramebuffer(GL_READ_FRAMEBUFFER, compFbo[cur]);
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dispFbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dispCFbo);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
         glBlitFramebuffer(0, 0, size, size, 0, 0, size, size, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dispPFbo);
+        glReadBuffer(GL_COLOR_ATTACHMENT1);
+        glBlitFramebuffer(0, 0, size, size, 0, 0, size, size, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, disp);
-        glGenerateMipmap(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, dispC); glGenerateMipmap(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, dispP); glGenerateMipmap(GL_TEXTURE_2D);
         glBindVertexArray(0);
         dirty = false;
     }
-    void readFinalRGB(std::vector<unsigned char>& rgb) {
-        std::vector<unsigned char> px((size_t)size * size * 4);
+    // Baca hasil akhir: color RGB, roughness (1 kanal), metallic (1 kanal)
+    void readFinal(std::vector<unsigned char>& rgb, std::vector<unsigned char>& rough, std::vector<unsigned char>& metal) {
+        size_t n = (size_t)size * size;
+        std::vector<unsigned char> a(n * 4), b(n * 4);
         glBindFramebuffer(GL_FRAMEBUFFER, compFbo[cur]);
-        glReadPixels(0, 0, size, size, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glReadPixels(0, 0, size, size, GL_RGBA, GL_UNSIGNED_BYTE, a.data());
+        glReadBuffer(GL_COLOR_ATTACHMENT1);
+        glReadPixels(0, 0, size, size, GL_RGBA, GL_UNSIGNED_BYTE, b.data());
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        rgb.resize((size_t)size * size * 3);
-        for (size_t i = 0; i < (size_t)size * size; i++) {
-            rgb[3 * i] = px[4 * i]; rgb[3 * i + 1] = px[4 * i + 1]; rgb[3 * i + 2] = px[4 * i + 2];
+        rgb.resize(n * 3); rough.resize(n); metal.resize(n);
+        for (size_t i = 0; i < n; i++) {
+            rgb[3 * i] = a[4 * i]; rgb[3 * i + 1] = a[4 * i + 1]; rgb[3 * i + 2] = a[4 * i + 2];
+            rough[i] = b[4 * i]; metal[i] = b[4 * i + 1];
         }
     }
 };
@@ -539,6 +673,14 @@ static std::string saveFileDialog() {
     return "texture.png";
 #endif
 }
+static std::string stripPng(const std::string& s) {
+    if (s.size() >= 4) {
+        std::string e = s.substr(s.size() - 4);
+        for (auto& ch : e) ch = (char)std::tolower((unsigned char)ch);
+        if (e == ".png") return s.substr(0, s.size() - 4);
+    }
+    return s;
+}
 
 int main(int argc, char** argv) {
     if (!glfwInit()) return 1;
@@ -585,13 +727,18 @@ int main(int argc, char** argv) {
     bool wire = false, showGrid = true, gridAtBase = true;
 
     bool paintMode = true, eraser = false, symmetry = false;
+    bool chColor = true, chRough = false, chMetal = false;
+    bool exportORM = true;
     float brushColor[3] = {0.85f, 0.2f, 0.2f};
+    float valRough = 0.5f, valMetal = 0.0f;
     float baseColor[3] = {0.8f, 0.8f, 0.8f};
+    float baseRough = 0.5f, baseMetal = 0.0f;
     float brushSizePct = 5.0f, hardness = 0.5f, opacity = 1.0f;
     const char* sizeNames[3] = {"512", "1024", "2048"};
     const int sizeVals[3] = {512, 1024, 2048};
     const char* blendNames[5] = {"Normal", "Multiply", "Screen", "Overlay", "Add"};
-    int sizeIdx = 1;
+    const char* viewNames[4] = {"Base Color", "PBR", "Roughness", "Metallic"};
+    int sizeIdx = 1, viewMode = 0;
     canvas.create(sizeVals[sizeIdx]);
 
     bool stroke = false, strokeSnap = false, undilated = false;
@@ -653,8 +800,9 @@ int main(int argc, char** argv) {
         // ---- painting ----
         float modelRadius = glm::length(mesh.bmax - mesh.bmin) * 0.5f;
         float radiusWorld = std::max(brushSizePct / 100.0f * modelRadius, 1e-5f);
+        bool anyChannel = chColor || chRough || chMetal;
         bool canPaint = paintMode && mesh.vao && mesh.hasUV && !io.KeyAlt && !io.KeyShift
-                        && !canvas.layers.empty() && canvas.layers[canvas.active].visible;
+                        && anyChannel && !canvas.layers.empty() && canvas.layers[canvas.active].visible;
         bool mouseOk = ImGui::IsMousePosValid() && !io.WantCaptureMouse;
         glm::vec2 mp(io.MousePos.x * io.DisplayFramebufferScale.x, io.MousePos.y * io.DisplayFramebufferScale.y);
 
@@ -673,8 +821,13 @@ int main(int argc, char** argv) {
             glEnable(GL_BLEND);
             if (eraser) glBlendFunc(GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);   // hapus -> transparan
             else glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);           // premultiplied
+            // hanya kanal yang dicentang yang tertulis
+            glColorMaski(0, (GLboolean)chColor, (GLboolean)chColor, (GLboolean)chColor, (GLboolean)chColor);
+            glColorMaski(1, (GLboolean)chRough, (GLboolean)chRough, (GLboolean)chMetal, (GLboolean)chMetal);
             glUseProgram(paintProg);
             glUniform3fv(glGetUniformLocation(paintProg, "uColor"), 1, brushColor);
+            glUniform1f(glGetUniformLocation(paintProg, "uRough"), valRough);
+            glUniform1f(glGetUniformLocation(paintProg, "uMetal"), valMetal);
             glUniform1f(glGetUniformLocation(paintProg, "uRadius"), radiusWorld);
             glUniform1f(glGetUniformLocation(paintProg, "uHardness"), std::min(hardness, 0.99f));
             glUniform1f(glGetUniformLocation(paintProg, "uOpacity"), opacity);
@@ -688,6 +841,7 @@ int main(int argc, char** argv) {
                 glUniform3f(locN, -n.x, n.y, n.z);
                 mesh.draw();
             }
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
             glDisable(GL_BLEND);
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
             canvas.dirty = true;
@@ -735,7 +889,14 @@ int main(int argc, char** argv) {
 
         ImGui::SeparatorText("Brush");
         ImGui::Checkbox("Mode Paint (Alt+Kiri = orbit)", &paintMode);
+        ImGui::Text("Kanal:");
+        ImGui::SameLine(); ImGui::Checkbox("Color", &chColor);
+        ImGui::SameLine(); ImGui::Checkbox("Rough", &chRough);
+        ImGui::SameLine(); ImGui::Checkbox("Metal", &chMetal);
+        if (!anyChannel) ImGui::TextColored(ImVec4(1, 0.6f, 0.2f, 1), "Pilih minimal 1 kanal.");
         ImGui::ColorEdit3("Warna", brushColor);
+        ImGui::SliderFloat("Roughness", &valRough, 0.0f, 1.0f);
+        ImGui::SliderFloat("Metallic", &valMetal, 0.0f, 1.0f);
         ImGui::SliderFloat("Ukuran (%)", &brushSizePct, 0.2f, 30.0f);
         ImGui::SliderFloat("Hardness", &hardness, 0.0f, 0.99f);
         ImGui::SliderFloat("Opacity", &opacity, 0.05f, 1.0f);
@@ -755,7 +916,7 @@ int main(int argc, char** argv) {
         {
             Layer& A = canvas.layers[canvas.active];
             if (ImGui::SliderFloat("Opacity layer", &A.opacity, 0.0f, 1.0f)) canvas.dirty = true;
-            if (ImGui::Combo("Blend", &A.blend, blendNames, 5)) canvas.dirty = true;
+            if (ImGui::Combo("Blend (Color)", &A.blend, blendNames, 5)) canvas.dirty = true;
         }
         if (ImGui::Button("Add")) canvas.addLayer();
         ImGui::SameLine();
@@ -766,13 +927,17 @@ int main(int argc, char** argv) {
         if (ImGui::Button("Turun")) canvas.moveActive(-1);
         if (ImGui::Button("Fill layer")) {
             canvas.pushUndo();
-            canvas.clearLayer(canvas.layers[canvas.active], brushColor[0], brushColor[1], brushColor[2], 1.0f);
+            const float col[4] = {brushColor[0], brushColor[1], brushColor[2], 1.0f};
+            const float pbr[4] = {valRough, 1.0f, valMetal, 1.0f};
+            canvas.clearChannels(canvas.layers[canvas.active], chColor, chRough, chMetal, col, pbr);
         }
         ImGui::SameLine();
         if (ImGui::Button("Clear layer")) {
             canvas.pushUndo();
-            canvas.clearLayer(canvas.layers[canvas.active], 0, 0, 0, 0);
+            const float z[4] = {0, 0, 0, 0};
+            canvas.clearChannels(canvas.layers[canvas.active], chColor, chRough, chMetal, z, z);
         }
+        ImGui::TextDisabled("Fill/Clear hanya untuk kanal yang dicentang");
 
         ImGui::SeparatorText("Texture");
         if (ImGui::Combo("Resolusi", &sizeIdx, sizeNames, 3)) {
@@ -780,26 +945,41 @@ int main(int argc, char** argv) {
             canvas.buildMask(mesh);
         }
         ImGui::TextDisabled("(ganti resolusi = reset semua layer)");
-        if (ImGui::ColorEdit3("Warna dasar", baseColor)) canvas.dirty = true;
+        if (ImGui::ColorEdit3("Color dasar", baseColor)) canvas.dirty = true;
+        if (ImGui::SliderFloat("Roughness dasar", &baseRough, 0.0f, 1.0f)) canvas.dirty = true;
+        if (ImGui::SliderFloat("Metallic dasar", &baseMetal, 0.0f, 1.0f)) canvas.dirty = true;
         if (ImGui::Button("Undo")) canvas.undo();
         ImGui::SameLine();
         if (ImGui::Button("Redo")) canvas.redo();
         ImGui::SameLine();
         ImGui::TextDisabled("(%d)", (int)canvas.undoS.size());
+
+        ImGui::Checkbox("Sertakan ORM (glTF)", &exportORM);
         if (ImGui::Button("Export PNG...")) {
             std::string path = saveFileDialog();
             if (!path.empty()) {
-                canvas.compose(baseColor, true);
+                canvas.compose(baseColor, baseRough, baseMetal, true);
                 undilated = false;
-                std::vector<unsigned char> rgb; canvas.readFinalRGB(rgb);
+                std::vector<unsigned char> rgb, rough, metal;
+                canvas.readFinal(rgb, rough, metal);
+                std::string stem = stripPng(path);
+                int sz = canvas.size;
                 stbi_flip_vertically_on_write(1);
-                if (stbi_write_png(path.c_str(), canvas.size, canvas.size, 3, rgb.data(), canvas.size * 3))
-                    status = "Tersimpan: " + path;
-                else status = "Gagal menyimpan PNG.";
+                bool ok = stbi_write_png((stem + "_BaseColor.png").c_str(), sz, sz, 3, rgb.data(), sz * 3) != 0;
+                ok = ok && stbi_write_png((stem + "_Roughness.png").c_str(), sz, sz, 1, rough.data(), sz) != 0;
+                ok = ok && stbi_write_png((stem + "_Metallic.png").c_str(), sz, sz, 1, metal.data(), sz) != 0;
+                if (ok && exportORM) {
+                    std::vector<unsigned char> orm((size_t)sz * sz * 3);
+                    for (size_t i = 0; i < (size_t)sz * sz; i++) { orm[3 * i] = 255; orm[3 * i + 1] = rough[i]; orm[3 * i + 2] = metal[i]; }
+                    ok = stbi_write_png((stem + "_ORM.png").c_str(), sz, sz, 3, orm.data(), sz * 3) != 0;
+                }
+                status = ok ? ("Tersimpan: " + stem + "_BaseColor / _Roughness / _Metallic" + (exportORM ? " / _ORM" : "") + ".png")
+                            : "Gagal menyimpan PNG.";
             }
         }
 
         ImGui::SeparatorText("View");
+        ImGui::Combo("Preview", &viewMode, viewNames, 4);
         ImGui::Checkbox("Wireframe", &wire);
         ImGui::SameLine();
         ImGui::Checkbox("Grid", &showGrid);
@@ -810,12 +990,13 @@ int main(int argc, char** argv) {
 
         // ---- komposit layer (padding hanya saat tidak sedang melukis) ----
         bool busy = stroke || ImGui::IsAnyItemActive();
-        if (canvas.dirty) { canvas.compose(baseColor, !busy); undilated = busy; }
-        else if (undilated && !busy) { canvas.compose(baseColor, true); undilated = false; }
+        if (canvas.dirty) { canvas.compose(baseColor, baseRough, baseMetal, !busy); undilated = busy; }
+        else if (undilated && !busy) { canvas.compose(baseColor, baseRough, baseMetal, true); undilated = false; }
 
         // ---- render ----
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glViewport(0, 0, fbw, fbh);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glDisable(GL_BLEND);
         glClearColor(0.16f, 0.17f, 0.19f, 1);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -838,14 +1019,19 @@ int main(int argc, char** argv) {
         if (mesh.vao) {
             glUseProgram(meshProg);
             glm::vec3 eye = cam.eye();
+            glm::vec3 light = glm::normalize(glm::normalize(eye - cam.target) + glm::vec3(0.5f, 0.8f, 0.2f));
             glUniformMatrix4fv(glGetUniformLocation(meshProg, "uMVP"), 1, GL_FALSE, glm::value_ptr(mvp));
             glUniform3fv(glGetUniformLocation(meshProg, "uEye"), 1, glm::value_ptr(eye));
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, canvas.disp);
+            glUniform3fv(glGetUniformLocation(meshProg, "uLight"), 1, glm::value_ptr(light));
+            glUniform1i(glGetUniformLocation(meshProg, "uView"), viewMode);
+            glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, canvas.dispC);
+            glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, canvas.dispP);
             glUniform1i(glGetUniformLocation(meshProg, "uTex"), 0);
+            glUniform1i(glGetUniformLocation(meshProg, "uTexP"), 1);
             glPolygonMode(GL_FRONT_AND_BACK, wire ? GL_LINE : GL_FILL);
             mesh.draw();
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+            glActiveTexture(GL_TEXTURE0);
         }
 
         ImGui::Render();
