@@ -1,4 +1,4 @@
-// LitePainter - Tahap 4: kanal PBR (Base Color / Roughness / Metallic) + preview PBR
+// LitePainter - Tahap 5: baking (AO + Curvature) dan UI baru
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 
@@ -17,11 +17,13 @@
 #include <stb_image_write.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -42,16 +44,16 @@ out vec3 vP; out vec3 vN; out vec2 vUV;
 void main(){ vP = aPos; vN = aNrm; vUV = aUV; gl_Position = uMVP * vec4(aPos,1.0); }
 )";
 
-// uView: 0 = Base Color, 1 = PBR, 2 = Roughness, 3 = Metallic
+// uView: 0 Base Color, 1 PBR, 2 Roughness, 3 Metallic, 4 AO, 5 Curvature
 static const char* kMeshFS = R"(#version 330 core
 in vec3 vP; in vec3 vN; in vec2 vUV;
 uniform vec3 uEye; uniform vec3 uLight;
 uniform sampler2D uTex; uniform sampler2D uTexP;
-uniform int uView;
+uniform sampler2D uTexAO; uniform sampler2D uTexCv;
+uniform int uView; uniform int uUseAO;
 out vec4 frag;
 const float PI = 3.14159265;
 
-// lingkungan prosedural sederhana (langit + tanah + matahari), makin kasar makin blur
 vec3 envMap(vec3 d, float r){
   float y = clamp(d.y, -1.0, 1.0);
   vec3 hor = vec3(0.80, 0.82, 0.86);
@@ -64,19 +66,23 @@ vec3 envMap(vec3 d, float r){
 }
 
 void main(){
+  if (uView == 4) { frag = vec4(vec3(texture(uTexAO, vUV).r), 1.0); return; }
+  if (uView == 5) { frag = vec4(vec3(texture(uTexCv, vUV).r), 1.0); return; }
+
   vec3 n = normalize(vN);
   vec3 v = normalize(uEye - vP);
   if (dot(n, v) < 0.0) n = -n;
   vec3 base = texture(uTex, vUV).rgb;
   vec2 rm = texture(uTexP, vUV).rg;
+  float ao = (uUseAO == 1) ? texture(uTexAO, vUV).r : 1.0;
 
   if (uView == 0) {
     float d = max(dot(n, v), 0.0);
     float sky = 0.5 + 0.5 * n.y;
-    frag = vec4(base * (0.3 + 0.5 * d + 0.2 * sky), 1.0);
+    frag = vec4(base * (0.3 + 0.5 * d + 0.2 * sky) * ao, 1.0);
     return;
   }
-  if (uView >= 2) {
+  if (uView == 2 || uView == 3) {
     float val = (uView == 2) ? rm.x : rm.y;
     float d = max(dot(n, v), 0.0);
     frag = vec4(vec3(val) * (0.35 + 0.65 * d), 1.0);
@@ -107,7 +113,7 @@ void main(){
   vec3 Fa = F0 + (max(vec3(1.0 - rough), F0) - F0) * pow(1.0 - NdV, 5.0);
   vec3 amb = (1.0 - Fa) * (1.0 - metal) * albedo * envMap(n, 1.0) * 0.8 + envMap(rv, rough) * Fa;
 
-  vec3 col = direct + amb;
+  vec3 col = direct * mix(1.0, ao, 0.5) + amb * ao;
   col = col / (1.0 + col);
   frag = vec4(pow(col, vec3(1.0 / 2.2)), 1.0);
 }
@@ -123,9 +129,6 @@ uniform vec3 uColor; out vec4 frag;
 void main(){ frag = vec4(uColor,1.0); }
 )";
 
-// Paint pass (MRT): mesh digambar di ruang UV. Output premultiplied.
-//   outColor = (rgb*a, a)
-//   outPbr   = (rough*a, a, metal*a, a)   -> R,G = roughness(+alpha), B,A = metallic(+alpha)
 static const char* kPaintVS = R"(#version 330 core
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNrm;
@@ -153,13 +156,19 @@ static const char* kMaskFS = R"(#version 330 core
 out vec4 frag;
 void main(){ frag = vec4(1.0); }
 )";
+// G-buffer di ruang UV: posisi + normal tiap texel (untuk baking)
+static const char* kGBufFS = R"(#version 330 core
+in vec3 vP; in vec3 vN;
+layout(location=0) out vec4 outPos;
+layout(location=1) out vec4 outNrm;
+void main(){ outPos = vec4(vP, 1.0); outNrm = vec4(normalize(vN), 0.0); }
+)";
 static const char* kFullVS = R"(#version 330 core
 void main(){
   vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
   gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
 }
 )";
-// Komposit satu layer. Hasil: outC = base color, outP = (roughness, metallic, 0, 1)
 static const char* kCompFS = R"(#version 330 core
 uniform sampler2D uDst; uniform sampler2D uLayer;
 uniform sampler2D uDstP; uniform sampler2D uLayerP;
@@ -190,7 +199,6 @@ void main(){
   outP = vec4(mix(dp.r, rv, ra), mix(dp.g, mv, ma), 0.0, 1.0);
 }
 )";
-// Padding seam untuk kedua texture sekaligus
 static const char* kDilFS = R"(#version 330 core
 uniform sampler2D uSrc; uniform sampler2D uMask; uniform sampler2D uSrcP; uniform int uStage;
 layout(location=0) out vec4 outC;
@@ -309,11 +317,11 @@ static bool loadOBJ(const std::string& path, Mesh& mesh, std::string& msg) {
     mesh.triangles = (int)verts.size() / 3;
     mesh.hasUV = !a.texcoords.empty();
     msg = "Loaded: " + path;
-    if (!mesh.hasUV) msg += "\nPERINGATAN: model tidak punya UV, painting nonaktif.";
+    if (!mesh.hasUV) msg += " | PERINGATAN: tidak ada UV, painting nonaktif.";
     return true;
 }
 
-// ================================================================ raycast
+// ================================================================ raycast (klik brush)
 struct Hit { bool ok = false; float t = 1e30f; glm::vec3 p{0}, n{0, 1, 0}; };
 
 static Hit raycast(const Mesh& m, const glm::vec3& o, const glm::vec3& d) {
@@ -341,6 +349,92 @@ static Hit raycast(const Mesh& m, const glm::vec3& o, const glm::vec3& d) {
     return best;
 }
 
+// ================================================================ BVH (untuk baking)
+struct BVH {
+    struct Node { glm::vec3 bmin; int left; glm::vec3 bmax; int count; };   // count>0 = daun (left = indeks pertama)
+    std::vector<Node> nodes;
+    std::vector<glm::vec3> v0, e1, e2;
+
+    void build(const std::vector<Vertex>& verts) {
+        int nt = (int)(verts.size() / 3);
+        std::vector<int> idx(nt);
+        std::vector<glm::vec3> cen(nt), tmin(nt), tmax(nt);
+        for (int i = 0; i < nt; i++) {
+            idx[i] = i;
+            const glm::vec3& a = verts[3 * i].p; const glm::vec3& b = verts[3 * i + 1].p; const glm::vec3& c = verts[3 * i + 2].p;
+            cen[i] = (a + b + c) / 3.0f;
+            tmin[i] = glm::min(a, glm::min(b, c));
+            tmax[i] = glm::max(a, glm::max(b, c));
+        }
+        nodes.clear(); nodes.reserve((size_t)nt * 2 + 1);
+        nodes.push_back(Node());
+        buildRec(0, 0, nt, idx, cen, tmin, tmax);
+        v0.resize(nt); e1.resize(nt); e2.resize(nt);
+        for (int i = 0; i < nt; i++) {
+            int t = idx[i];
+            v0[i] = verts[3 * t].p;
+            e1[i] = verts[3 * t + 1].p - v0[i];
+            e2[i] = verts[3 * t + 2].p - v0[i];
+        }
+    }
+    void buildRec(int ni, int b, int e, std::vector<int>& idx, const std::vector<glm::vec3>& cen,
+                  const std::vector<glm::vec3>& tmin, const std::vector<glm::vec3>& tmax) {
+        glm::vec3 bmin(1e30f), bmax(-1e30f), cmin(1e30f), cmax(-1e30f);
+        for (int i = b; i < e; i++) {
+            int t = idx[i];
+            bmin = glm::min(bmin, tmin[t]); bmax = glm::max(bmax, tmax[t]);
+            cmin = glm::min(cmin, cen[t]); cmax = glm::max(cmax, cen[t]);
+        }
+        nodes[ni].bmin = bmin; nodes[ni].bmax = bmax;
+        int cnt = e - b;
+        if (cnt <= 4) { nodes[ni].left = b; nodes[ni].count = cnt; return; }
+        glm::vec3 ext = cmax - cmin;
+        int axis = (ext.x > ext.y) ? ((ext.x > ext.z) ? 0 : 2) : ((ext.y > ext.z) ? 1 : 2);
+        int mid = (b + e) / 2;
+        std::nth_element(idx.begin() + b, idx.begin() + mid, idx.begin() + e,
+                         [&](int x, int y) { return cen[x][axis] < cen[y][axis]; });
+        int l = (int)nodes.size();
+        nodes.push_back(Node()); nodes.push_back(Node());
+        nodes[ni].left = l; nodes[ni].count = 0;
+        buildRec(l, b, mid, idx, cen, tmin, tmax);
+        buildRec(l + 1, mid, e, idx, cen, tmin, tmax);
+    }
+    bool anyHit(const glm::vec3& o, const glm::vec3& d, float tmax) const {
+        glm::vec3 inv(1.0f / (std::fabs(d.x) < 1e-9f ? 1e-9f : d.x),
+                      1.0f / (std::fabs(d.y) < 1e-9f ? 1e-9f : d.y),
+                      1.0f / (std::fabs(d.z) < 1e-9f ? 1e-9f : d.z));
+        int stack[64]; int sp = 0;
+        stack[sp++] = 0;
+        while (sp > 0) {
+            const Node& n = nodes[stack[--sp]];
+            glm::vec3 t0 = (n.bmin - o) * inv, t1 = (n.bmax - o) * inv;
+            glm::vec3 tn = glm::min(t0, t1), tf = glm::max(t0, t1);
+            float tnear = std::max(std::max(tn.x, tn.y), std::max(tn.z, 0.0f));
+            float tfar = std::min(std::min(tf.x, tf.y), std::min(tf.z, tmax));
+            if (tnear > tfar) continue;
+            if (n.count > 0) {
+                for (int i = n.left; i < n.left + n.count; i++) {
+                    glm::vec3 pv = glm::cross(d, e2[i]);
+                    float det = glm::dot(e1[i], pv);
+                    if (std::fabs(det) < 1e-12f) continue;
+                    float idet = 1.0f / det;
+                    glm::vec3 tv = o - v0[i];
+                    float u = glm::dot(tv, pv) * idet;
+                    if (u < 0.0f || u > 1.0f) continue;
+                    glm::vec3 qv = glm::cross(tv, e1[i]);
+                    float w = glm::dot(d, qv) * idet;
+                    if (w < 0.0f || u + w > 1.0f) continue;
+                    float t = glm::dot(e2[i], qv) * idet;
+                    if (t > 1e-6f && t < tmax) return true;
+                }
+            } else {
+                stack[sp++] = n.left; stack[sp++] = n.left + 1;
+            }
+        }
+        return false;
+    }
+};
+
 // ================================================================ GL helpers
 static GLuint makeTex(int sz, GLint internalFmt, GLenum fmt, bool mips) {
     GLuint t; glGenTextures(1, &t);
@@ -360,7 +454,7 @@ static GLuint makeFbo(GLuint tex) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     return f;
 }
-static GLuint makeFbo2(GLuint t0, GLuint t1) {   // 2 attachment (MRT)
+static GLuint makeFbo2(GLuint t0, GLuint t1) {
     GLuint f; glGenFramebuffers(1, &f);
     glBindFramebuffer(GL_FRAMEBUFFER, f);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t0, 0);
@@ -375,11 +469,9 @@ static GLuint makeFbo2(GLuint t0, GLuint t1) {   // 2 attachment (MRT)
 struct Layer {
     int id = 0;
     std::string name;
-    GLuint tex = 0;    // base color RGBA8, premultiplied
-    GLuint texP = 0;   // (rough*a, a, metal*a, a)
-    GLuint fbo = 0;    // MRT: attachment0 = tex, attachment1 = texP
+    GLuint tex = 0, texP = 0, fbo = 0;
     float opacity = 1.0f;
-    int blend = 0;     // 0 Normal,1 Multiply,2 Screen,3 Overlay,4 Add (berlaku untuk Base Color)
+    int blend = 0;
     bool visible = true;
 };
 struct UndoEntry { int layerId = 0; std::vector<unsigned char> px, pxP; };
@@ -436,7 +528,6 @@ struct Canvas {
         addLayer();
         dirty = true;
     }
-    // Isi/hapus hanya kanal yang aktif (c = color, r = roughness, m = metallic)
     void clearChannels(Layer& L, bool c, bool r, bool m, const float col[4], const float pbr[4]) {
         glBindFramebuffer(GL_FRAMEBUFFER, L.fbo);
         glViewport(0, 0, size, size);
@@ -473,7 +564,7 @@ struct Canvas {
         active = std::min(active, (int)layers.size() - 1);
         dirty = true;
     }
-    void moveActive(int dir) {   // +1 = naik, -1 = turun
+    void moveActive(int dir) {
         int j = active + dir;
         if (j < 0 || j >= (int)layers.size()) return;
         std::swap(layers[active], layers[j]);
@@ -496,7 +587,7 @@ struct Canvas {
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, size, size, GL_RGBA, GL_UNSIGNED_BYTE, in.data());
         dirty = true;
     }
-    void pushUndo() {   // snapshot layer aktif
+    void pushUndo() {
         UndoEntry e; e.layerId = layers[active].id;
         readAtt(layers[active], 0, e.px);
         readAtt(layers[active], 1, e.pxP);
@@ -541,7 +632,6 @@ struct Canvas {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         maskValid = true; dirty = true;
     }
-    // Gabungkan semua layer -> dispC / dispP.  dilate = isi area di luar UV (padding seam)
     void compose(const float base[3], float baseRough, float baseMetal, bool dilate) {
         glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -592,7 +682,6 @@ struct Canvas {
             }
         }
 
-        // salin ke texture tampilan (punya mipmap)
         glBindFramebuffer(GL_READ_FRAMEBUFFER, compFbo[cur]);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dispCFbo);
         glReadBuffer(GL_COLOR_ATTACHMENT0);
@@ -608,7 +697,6 @@ struct Canvas {
         glBindVertexArray(0);
         dirty = false;
     }
-    // Baca hasil akhir: color RGB, roughness (1 kanal), metallic (1 kanal)
     void readFinal(std::vector<unsigned char>& rgb, std::vector<unsigned char>& rough, std::vector<unsigned char>& metal) {
         size_t n = (size_t)size * size;
         std::vector<unsigned char> a(n * 4), b(n * 4);
@@ -627,6 +715,249 @@ struct Canvas {
     }
 };
 
+// ================================================================ baking
+struct BakeParams {
+    bool ao = true, curv = true;
+    int samples = 32;
+    float distPct = 30.0f, power = 1.0f;
+    bool flip = false;
+    int curvRadius = 2;
+    float curvStrength = 2.0f;
+};
+
+struct BakeJob {
+    std::atomic<bool> running{false}, done{false}, cancel{false};
+    std::atomic<int> rowsDone{0}, stage{0};   // stage: 0 BVH, 1 AO, 2 Curvature, 3 Padding
+    std::thread master;
+    int size = 0;
+    BakeParams P;
+    float modelRadius = 1.0f;
+    std::vector<float> pos, nrm;      // RGBA32F per texel dari G-buffer
+    std::vector<Vertex> tris;
+    std::vector<unsigned char> aoOut, curvOut;
+    bool hasAO = false, hasCurv = false;
+};
+
+struct BakeMaps {   // hasil bake di sisi GPU/CPU
+    GLuint ao = 0, curv = 0;
+    bool hasAO = false, hasCurv = false;
+    int size = 0;
+    std::vector<unsigned char> aoPx, curvPx;
+
+    static GLuint upload(int sz, const std::vector<unsigned char>& d) {
+        GLuint t = makeTex(sz, GL_R8, GL_RED, true);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, sz, sz, GL_RED, GL_UNSIGNED_BYTE, d.data());
+        glGenerateMipmap(GL_TEXTURE_2D);
+        return t;
+    }
+    void clear() {
+        if (ao) glDeleteTextures(1, &ao);
+        if (curv) glDeleteTextures(1, &curv);
+        ao = curv = 0; hasAO = hasCurv = false; size = 0;
+        aoPx.clear(); curvPx.clear();
+    }
+    void set(int sz, const std::vector<unsigned char>* a, const std::vector<unsigned char>* c) {
+        if (size != sz) clear();
+        size = sz;
+        if (a) { if (ao) glDeleteTextures(1, &ao); aoPx = *a; ao = upload(sz, aoPx); hasAO = true; }
+        if (c) { if (curv) glDeleteTextures(1, &curv); curvPx = *c; curv = upload(sz, curvPx); hasCurv = true; }
+    }
+};
+
+// Render posisi + normal tiap texel (ruang UV) ke array float
+static void renderGBuffer(const Mesh& m, GLuint prog, int sz, std::vector<float>& pos, std::vector<float>& nrm) {
+    GLuint t[2];
+    glGenTextures(2, t);
+    for (int i = 0; i < 2; i++) {
+        glBindTexture(GL_TEXTURE_2D, t[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, sz, sz, 0, GL_RGBA, GL_FLOAT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+    }
+    GLuint f = makeFbo2(t[0], t[1]);
+    glBindFramebuffer(GL_FRAMEBUFFER, f);
+    glViewport(0, 0, sz, sz);
+    glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    const float z[4] = {0, 0, 0, 0};
+    glClearBufferfv(GL_COLOR, 0, z);
+    glClearBufferfv(GL_COLOR, 1, z);
+    glUseProgram(prog);
+    m.draw();
+    pos.resize((size_t)sz * sz * 4); nrm.resize((size_t)sz * sz * 4);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glReadPixels(0, 0, sz, sz, GL_RGBA, GL_FLOAT, pos.data());
+    glReadBuffer(GL_COLOR_ATTACHMENT1);
+    glReadPixels(0, 0, sz, sz, GL_RGBA, GL_FLOAT, nrm.data());
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &f);
+    glDeleteTextures(2, t);
+}
+
+static unsigned hash2(unsigned x, unsigned y) {
+    unsigned h = x * 374761393u + y * 668265263u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    return h ^ (h >> 16);
+}
+static float radicalInverse2(unsigned bits) {
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return (float)bits * 2.3283064365386963e-10f;
+}
+// Lebarkan piksel valid keluar island UV (padding seam) untuk map 1 kanal
+static void dilateU8(std::vector<unsigned char>& img, const std::vector<unsigned char>& cover, int sz, int passes) {
+    std::vector<unsigned char> valid = cover, nimg, nvalid;
+    for (int p = 0; p < passes; p++) {
+        nimg = img; nvalid = valid;
+        bool any = false;
+        for (int y = 0; y < sz; y++) {
+            for (int x = 0; x < sz; x++) {
+                size_t i = (size_t)y * sz + x;
+                if (valid[i]) continue;
+                int sum = 0, cnt = 0;
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        int xx = x + dx, yy = y + dy;
+                        if (xx < 0 || yy < 0 || xx >= sz || yy >= sz) continue;
+                        size_t j = (size_t)yy * sz + xx;
+                        if (valid[j]) { sum += img[j]; cnt++; }
+                    }
+                }
+                if (cnt > 0) { nimg[i] = (unsigned char)(sum / cnt); nvalid[i] = 1; any = true; }
+            }
+        }
+        img.swap(nimg); valid.swap(nvalid);
+        if (!any) break;
+    }
+}
+
+static void bakeMain(BakeJob* J) {
+    const int sz = J->size;
+    const size_t n = (size_t)sz * sz;
+    const BakeParams P = J->P;
+    const float R = J->modelRadius;
+    std::vector<unsigned char> cover(n);
+    for (size_t i = 0; i < n; i++) cover[i] = J->pos[4 * i + 3] > 0.5f ? 1 : 0;
+
+    // ---------------- AO ----------------
+    if (P.ao && !J->cancel) {
+        J->stage = 0;
+        BVH bvh;
+        bvh.build(J->tris);
+        J->stage = 1; J->rowsDone = 0;
+        J->aoOut.assign(n, 255);
+        const float maxDist = std::max(P.distPct / 100.0f * R, 1e-5f);
+        const float eps = R * 0.001f;
+        const int S = P.samples;
+        std::atomic<int> nextRow(0);
+        auto worker = [&]() {
+            for (;;) {
+                if (J->cancel) return;
+                int y = nextRow.fetch_add(1);
+                if (y >= sz) return;
+                for (int x = 0; x < sz; x++) {
+                    size_t i = (size_t)y * sz + x;
+                    if (!cover[i]) continue;
+                    glm::vec3 N(J->nrm[4 * i], J->nrm[4 * i + 1], J->nrm[4 * i + 2]);
+                    float ln = glm::length(N);
+                    if (ln < 1e-5f) continue;
+                    N /= ln;
+                    if (P.flip) N = -N;
+                    glm::vec3 Pp(J->pos[4 * i], J->pos[4 * i + 1], J->pos[4 * i + 2]);
+                    glm::vec3 org = Pp + N * eps;
+                    glm::vec3 up = std::fabs(N.y) < 0.99f ? glm::vec3(0, 1, 0) : glm::vec3(1, 0, 0);
+                    glm::vec3 T = glm::normalize(glm::cross(up, N));
+                    glm::vec3 B = glm::cross(N, T);
+                    float rnd = (float)(hash2((unsigned)x, (unsigned)y) & 0xFFFFu) / 65536.0f;
+                    int hits = 0;
+                    for (int s = 0; s < S; s++) {
+                        float u1 = ((float)s + 0.5f) / (float)S;
+                        float u2 = radicalInverse2((unsigned)s) + rnd;
+                        u2 -= std::floor(u2);
+                        float r = std::sqrt(u1);
+                        float phi = 6.2831853f * u2;
+                        glm::vec3 d = T * (r * std::cos(phi)) + B * (r * std::sin(phi)) + N * std::sqrt(1.0f - u1);
+                        if (bvh.anyHit(org, d, maxDist)) hits++;
+                    }
+                    float ao = 1.0f - (float)hits / (float)S;
+                    ao = std::pow(ao, P.power);
+                    J->aoOut[i] = (unsigned char)(glm::clamp(ao, 0.0f, 1.0f) * 255.0f + 0.5f);
+                }
+                J->rowsDone.fetch_add(1);
+            }
+        };
+        unsigned hc = std::thread::hardware_concurrency();
+        int nt = hc > 1 ? (int)hc - 1 : 1;
+        std::vector<std::thread> th;
+        for (int i = 0; i < nt; i++) th.emplace_back(worker);
+        for (auto& t : th) t.join();
+        if (!J->cancel) {
+            J->stage = 3;
+            dilateU8(J->aoOut, cover, sz, std::max(4, sz / 128));
+            J->hasAO = true;
+        }
+    }
+
+    // ---------------- Curvature (dari posisi + normal texel) ----------------
+    if (P.curv && !J->cancel) {
+        J->stage = 2;
+        const int k = P.curvRadius;
+        std::vector<float> cf(n, 0.5f);
+        auto ok = [&](int x, int y) { return x >= 0 && y >= 0 && x < sz && y < sz && cover[(size_t)y * sz + x]; };
+        auto pos3 = [&](int x, int y) { size_t i = (size_t)y * sz + x; return glm::vec3(J->pos[4 * i], J->pos[4 * i + 1], J->pos[4 * i + 2]); };
+        auto nrm3 = [&](int x, int y) { size_t i = (size_t)y * sz + x; return glm::vec3(J->nrm[4 * i], J->nrm[4 * i + 1], J->nrm[4 * i + 2]); };
+        for (int y = 0; y < sz; y++) {
+            for (int x = 0; x < sz; x++) {
+                size_t i = (size_t)y * sz + x;
+                if (!cover[i]) continue;
+                float c = 0.0f; int cnt = 0;
+                if (ok(x - k, y) && ok(x + k, y)) {
+                    glm::vec3 dP = pos3(x + k, y) - pos3(x - k, y), dN = nrm3(x + k, y) - nrm3(x - k, y);
+                    float d2 = glm::dot(dP, dP);
+                    if (d2 > 1e-12f) { c += glm::dot(dN, dP) / d2; cnt++; }
+                }
+                if (ok(x, y - k) && ok(x, y + k)) {
+                    glm::vec3 dP = pos3(x, y + k) - pos3(x, y - k), dN = nrm3(x, y + k) - nrm3(x, y - k);
+                    float d2 = glm::dot(dP, dP);
+                    if (d2 > 1e-12f) { c += glm::dot(dN, dP) / d2; cnt++; }
+                }
+                if (cnt > 0) c /= (float)cnt;
+                cf[i] = 0.5f + 0.5f * std::tanh(c * R * P.curvStrength * 0.15f);
+            }
+        }
+        // haluskan sedikit (box 3x3, 2 kali)
+        for (int pass = 0; pass < 2; pass++) {
+            std::vector<float> tmp = cf;
+            for (int y = 0; y < sz; y++) {
+                for (int x = 0; x < sz; x++) {
+                    size_t i = (size_t)y * sz + x;
+                    if (!cover[i]) continue;
+                    float sum = 0.0f; int cnt = 0;
+                    for (int dy = -1; dy <= 1; dy++)
+                        for (int dx = -1; dx <= 1; dx++)
+                            if (ok(x + dx, y + dy)) { sum += cf[(size_t)(y + dy) * sz + (x + dx)]; cnt++; }
+                    if (cnt > 0) tmp[i] = sum / (float)cnt;
+                }
+            }
+            cf.swap(tmp);
+        }
+        J->curvOut.assign(n, 128);
+        for (size_t i = 0; i < n; i++) J->curvOut[i] = (unsigned char)(glm::clamp(cf[i], 0.0f, 1.0f) * 255.0f + 0.5f);
+        if (!J->cancel) {
+            J->stage = 3;
+            dilateU8(J->curvOut, cover, sz, std::max(4, sz / 128));
+            J->hasCurv = true;
+        }
+    }
+    J->done = true;
+}
+
 // ================================================================ camera
 struct Camera {
     float yaw = 0.6f, pitch = 0.4f, dist = 5.0f;
@@ -642,7 +973,7 @@ struct Camera {
     }
 };
 
-// ================================================================ misc
+// ================================================================ misc + UI helpers
 static std::string g_dropped;
 static void dropCallback(GLFWwindow*, int n, const char** paths) { if (n > 0) g_dropped = paths[0]; }
 
@@ -682,12 +1013,62 @@ static std::string stripPng(const std::string& s) {
     return s;
 }
 
+static const ImVec4 kAccent(0.20f, 0.55f, 0.95f, 1.0f);
+
+static void applyStyle() {
+    ImGui::StyleColorsDark();
+    ImGuiStyle& s = ImGui::GetStyle();
+    s.WindowRounding = 0.0f; s.ChildRounding = 4.0f; s.FrameRounding = 4.0f; s.GrabRounding = 4.0f;
+    s.TabRounding = 4.0f; s.PopupRounding = 4.0f; s.ScrollbarRounding = 6.0f;
+    s.WindowPadding = ImVec2(12, 10); s.FramePadding = ImVec2(8, 5);
+    s.ItemSpacing = ImVec2(8, 7); s.ItemInnerSpacing = ImVec2(6, 4);
+    s.WindowBorderSize = 1.0f; s.FrameBorderSize = 0.0f;
+    ImVec4* c = s.Colors;
+    c[ImGuiCol_WindowBg]       = ImVec4(0.105f, 0.110f, 0.125f, 1.0f);
+    c[ImGuiCol_PopupBg]        = ImVec4(0.12f, 0.125f, 0.14f, 0.98f);
+    c[ImGuiCol_Border]         = ImVec4(0.20f, 0.21f, 0.24f, 1.0f);
+    c[ImGuiCol_FrameBg]        = ImVec4(0.165f, 0.175f, 0.20f, 1.0f);
+    c[ImGuiCol_FrameBgHovered] = ImVec4(0.21f, 0.23f, 0.27f, 1.0f);
+    c[ImGuiCol_FrameBgActive]  = ImVec4(0.24f, 0.27f, 0.32f, 1.0f);
+    c[ImGuiCol_TitleBg]        = ImVec4(0.09f, 0.095f, 0.11f, 1.0f);
+    c[ImGuiCol_TitleBgActive]  = ImVec4(0.09f, 0.095f, 0.11f, 1.0f);
+    c[ImGuiCol_MenuBarBg]      = ImVec4(0.09f, 0.095f, 0.11f, 1.0f);
+    c[ImGuiCol_Button]         = ImVec4(0.20f, 0.22f, 0.26f, 1.0f);
+    c[ImGuiCol_ButtonHovered]  = ImVec4(0.27f, 0.30f, 0.36f, 1.0f);
+    c[ImGuiCol_ButtonActive]   = kAccent;
+    c[ImGuiCol_Header]         = ImVec4(0.20f, 0.35f, 0.60f, 0.55f);
+    c[ImGuiCol_HeaderHovered]  = ImVec4(0.22f, 0.40f, 0.70f, 0.70f);
+    c[ImGuiCol_HeaderActive]   = ImVec4(0.22f, 0.45f, 0.80f, 0.90f);
+    c[ImGuiCol_SliderGrab]     = kAccent;
+    c[ImGuiCol_SliderGrabActive] = ImVec4(0.35f, 0.65f, 1.0f, 1.0f);
+    c[ImGuiCol_CheckMark]      = kAccent;
+    c[ImGuiCol_Tab]            = ImVec4(0.14f, 0.15f, 0.18f, 1.0f);
+    c[ImGuiCol_TabHovered]     = ImVec4(0.22f, 0.40f, 0.70f, 1.0f);
+    c[ImGuiCol_TabSelected]    = ImVec4(0.18f, 0.40f, 0.75f, 1.0f);
+    c[ImGuiCol_Separator]      = ImVec4(0.22f, 0.23f, 0.27f, 1.0f);
+    c[ImGuiCol_PlotHistogram]  = kAccent;
+}
+
+// Tombol toggle: biru saat aktif
+static bool toggleBtn(const char* label, bool* v, float w) {
+    bool on = *v;
+    if (on) {
+        ImGui::PushStyleColor(ImGuiCol_Button, kAccent);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.62f, 1.0f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.15f, 0.45f, 0.85f, 1.0f));
+    }
+    bool pressed = ImGui::Button(label, ImVec2(w, 0));
+    if (on) ImGui::PopStyleColor(3);
+    if (pressed) *v = !*v;
+    return pressed;
+}
+
 int main(int argc, char** argv) {
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    GLFWwindow* win = glfwCreateWindow(1280, 720, "LitePainter", nullptr, nullptr);
+    GLFWwindow* win = glfwCreateWindow(1366, 768, "LitePainter", nullptr, nullptr);
     if (!win) { std::fprintf(stderr, "Gagal buat window (butuh OpenGL 3.3)\n"); return 1; }
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
@@ -696,19 +1077,32 @@ int main(int argc, char** argv) {
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImGui::StyleColorsDark();
+    {
+        ImGuiIO& io0 = ImGui::GetIO();
+        io0.IniFilename = nullptr;
+        ImFontConfig fc; fc.SizePixels = 16.0f;
+        io0.Fonts->AddFontDefault(&fc);
+    }
+    applyStyle();
     ImGui_ImplGlfw_InitForOpenGL(win, true);
     ImGui_ImplOpenGL3_Init("#version 330");
 
     GLuint meshProg = makeProgram(kMeshVS, kMeshFS);
     GLuint lineProg = makeProgram(kLineVS, kLineFS);
     GLuint paintProg = makeProgram(kPaintVS, kPaintFS);
+    GLuint gbufProg = makeProgram(kPaintVS, kGBufFS);
 
     Mesh mesh; Camera cam; Canvas canvas;
     canvas.maskProg = makeProgram(kPaintVS, kMaskFS);
     canvas.compProg = makeProgram(kFullVS, kCompFS);
     canvas.dilProg = makeProgram(kFullVS, kDilFS);
     glGenVertexArrays(1, &canvas.emptyVao);
+
+    // texture dummy 1x1 untuk AO / curvature saat belum ada hasil bake
+    GLuint dummyWhite = makeTex(1, GL_R8, GL_RED, false);
+    { unsigned char w = 255; glPixelStorei(GL_UNPACK_ALIGNMENT, 1); glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1, GL_RED, GL_UNSIGNED_BYTE, &w); }
+    GLuint dummyGray = makeTex(1, GL_R8, GL_RED, false);
+    { unsigned char g = 128; glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1, GL_RED, GL_UNSIGNED_BYTE, &g); }
 
     // grid
     std::vector<glm::vec3> gl;
@@ -723,12 +1117,12 @@ int main(int argc, char** argv) {
     glEnableVertexAttribArray(0); glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), nullptr);
     glBindVertexArray(0);
 
-    std::string status = "Drag & drop file .obj ke window, atau klik Open OBJ.";
-    bool wire = false, showGrid = true, gridAtBase = true;
+    std::string status = "Drag & drop file .obj ke window, atau File > Open OBJ.";
+    bool wire = false, showGrid = true, gridAtBase = true, useAO = true;
 
     bool paintMode = true, eraser = false, symmetry = false;
     bool chColor = true, chRough = false, chMetal = false;
-    bool exportORM = true;
+    bool exportORM = true, exportBake = true;
     float brushColor[3] = {0.85f, 0.2f, 0.2f};
     float valRough = 0.5f, valMetal = 0.0f;
     float baseColor[3] = {0.8f, 0.8f, 0.8f};
@@ -737,29 +1131,128 @@ int main(int argc, char** argv) {
     const char* sizeNames[3] = {"512", "1024", "2048"};
     const int sizeVals[3] = {512, 1024, 2048};
     const char* blendNames[5] = {"Normal", "Multiply", "Screen", "Overlay", "Add"};
-    const char* viewNames[4] = {"Base Color", "PBR", "Roughness", "Metallic"};
-    int sizeIdx = 1, viewMode = 0;
+    const char* viewNames[6] = {"Base Color", "PBR", "Roughness", "Metallic", "AO (bake)", "Curvature (bake)"};
+    const char* qualNames[3] = {"Rendah (16 sampel)", "Sedang (32 sampel)", "Tinggi (64 sampel)"};
+    int sizeIdx = 1, viewMode = 0, bakeQ = 1;
+    BakeParams bp;
     canvas.create(sizeVals[sizeIdx]);
+
+    BakeJob job;
+    BakeMaps bakeMaps;
 
     bool stroke = false, strokeSnap = false, undilated = false;
     glm::vec2 lastMp(0);
 
+    auto bakeStop = [&]() {
+        if (job.master.joinable()) { job.cancel = true; job.master.join(); }
+        job.running = false; job.done = false;
+    };
     auto tryLoad = [&](const std::string& p) {
         if (p.empty()) return;
+        bakeStop();
         if (loadOBJ(p, mesh, status)) {
             cam.fit(mesh.bmin, mesh.bmax);
+            bakeMaps.clear();
             canvas.create(sizeVals[sizeIdx]);
             canvas.buildMask(mesh);
         }
     };
+    auto startBake = [&]() {
+        if (job.running || !mesh.vao || !mesh.hasUV) return;
+        if (!bp.ao && !bp.curv) { status = "Pilih AO atau Curvature dulu."; return; }
+        bakeStop();
+        bp.samples = bakeQ == 0 ? 16 : (bakeQ == 1 ? 32 : 64);
+        job.P = bp;
+        job.size = canvas.size;
+        job.modelRadius = std::max(glm::length(mesh.bmax - mesh.bmin) * 0.5f, 1e-5f);
+        renderGBuffer(mesh, gbufProg, job.size, job.pos, job.nrm);
+        job.tris = mesh.cpu;
+        job.aoOut.clear(); job.curvOut.clear();
+        job.hasAO = job.hasCurv = false;
+        job.cancel = false; job.done = false; job.rowsDone = 0; job.stage = 0; job.running = true;
+        job.master = std::thread(bakeMain, &job);
+        status = "Bake berjalan...";
+    };
+    auto finishBake = [&]() {
+        if (job.master.joinable()) job.master.join();
+        job.done = false; job.running = false;
+        if (job.cancel) { status = "Bake dibatalkan."; return; }
+        bakeMaps.set(job.size, job.hasAO ? &job.aoOut : nullptr, job.hasCurv ? &job.curvOut : nullptr);
+        job.pos.clear(); job.pos.shrink_to_fit(); job.nrm.clear(); job.nrm.shrink_to_fit();
+        job.tris.clear(); job.tris.shrink_to_fit();
+        status = "Bake selesai.";
+        if (job.hasAO) viewMode = 4;
+        else if (job.hasCurv) viewMode = 5;
+    };
+    auto bakeToLayer = [&](const std::vector<unsigned char>& src, int blend, float op, const char* name) {
+        if (src.empty() || bakeMaps.size != canvas.size) { status = "Hasil bake tidak cocok dengan resolusi texture."; return; }
+        if (canvas.layers.size() >= Canvas::kMaxLayers) { status = "Layer penuh (maks 6)."; return; }
+        canvas.addLayer();
+        Layer& L = canvas.layers[canvas.active];
+        std::vector<unsigned char> rgba(src.size() * 4);
+        for (size_t i = 0; i < src.size(); i++) {
+            rgba[4 * i] = rgba[4 * i + 1] = rgba[4 * i + 2] = src[i]; rgba[4 * i + 3] = 255;
+        }
+        canvas.writeTex(L.tex, rgba);
+        L.blend = blend; L.opacity = op; L.name = name;
+        canvas.dirty = true;
+        status = std::string("Ditambahkan layer: ") + name;
+    };
+    auto doExport = [&]() {
+        std::string path = saveFileDialog();
+        if (path.empty()) return;
+        canvas.compose(baseColor, baseRough, baseMetal, true);
+        undilated = false;
+        std::vector<unsigned char> rgb, rough, metal;
+        canvas.readFinal(rgb, rough, metal);
+        std::string stem = stripPng(path);
+        int sz = canvas.size;
+        stbi_flip_vertically_on_write(1);
+        bool ok = stbi_write_png((stem + "_BaseColor.png").c_str(), sz, sz, 3, rgb.data(), sz * 3) != 0;
+        ok = ok && stbi_write_png((stem + "_Roughness.png").c_str(), sz, sz, 1, rough.data(), sz) != 0;
+        ok = ok && stbi_write_png((stem + "_Metallic.png").c_str(), sz, sz, 1, metal.data(), sz) != 0;
+        bool bakeFits = bakeMaps.size == sz;
+        if (ok && exportORM) {
+            std::vector<unsigned char> orm((size_t)sz * sz * 3);
+            bool useBakedAO = bakeMaps.hasAO && bakeFits;
+            for (size_t i = 0; i < (size_t)sz * sz; i++) {
+                orm[3 * i] = useBakedAO ? bakeMaps.aoPx[i] : 255;
+                orm[3 * i + 1] = rough[i]; orm[3 * i + 2] = metal[i];
+            }
+            ok = stbi_write_png((stem + "_ORM.png").c_str(), sz, sz, 3, orm.data(), sz * 3) != 0;
+        }
+        if (ok && exportBake && bakeFits) {
+            if (bakeMaps.hasAO) ok = ok && stbi_write_png((stem + "_AO.png").c_str(), sz, sz, 1, bakeMaps.aoPx.data(), sz) != 0;
+            if (bakeMaps.hasCurv) ok = ok && stbi_write_png((stem + "_Curvature.png").c_str(), sz, sz, 1, bakeMaps.curvPx.data(), sz) != 0;
+        }
+        status = ok ? ("Export selesai: " + stem + "_*.png") : "Gagal menyimpan PNG.";
+    };
     if (argc > 1) tryLoad(argv[1]);
+
+    const ImGuiWindowFlags panelFlags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
+                                        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoSavedSettings |
+                                        ImGuiWindowFlags_NoBringToFrontOnFocus;
 
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
         if (!g_dropped.empty()) { tryLoad(g_dropped); g_dropped.clear(); }
+        if (job.done.load()) finishBake();
 
         ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplGlfw_NewFrame(); ImGui::NewFrame();
         ImGuiIO& io = ImGui::GetIO();
+
+        // ---- layout: panel kiri, panel kanan, status bawah, viewport di tengah ----
+        const float winW = io.DisplaySize.x, winH = io.DisplaySize.y;
+        const float menuH = ImGui::GetFrameHeight();
+        const float leftW = 330.0f, rightW = 270.0f, statusH = 30.0f;
+        const float sx = io.DisplayFramebufferScale.x, sy = io.DisplayFramebufferScale.y;
+        int fbw, fbh; glfwGetFramebufferSize(win, &fbw, &fbh);
+        const int vpx = (int)(leftW * sx), vpy = (int)(statusH * sy);
+        const int vpw = std::max(1, (int)((winW - leftW - rightW) * sx));
+        const int vph = std::max(1, (int)((winH - menuH - statusH) * sy));
+        bool mouseInView = ImGui::IsMousePosValid() &&
+                           io.MousePos.x >= leftW && io.MousePos.x <= winW - rightW &&
+                           io.MousePos.y >= menuH && io.MousePos.y <= winH - statusH;
 
         // ---- kamera ----
         if (!io.WantCaptureMouse) {
@@ -777,13 +1270,12 @@ int main(int argc, char** argv) {
                 float s = cam.dist * 0.0015f;
                 cam.target += (-right * io.MouseDelta.x + up * io.MouseDelta.y) * s;
             }
-            if (io.MouseWheel != 0) cam.dist *= (io.MouseWheel > 0) ? 0.9f : 1.1f;
+            if (io.MouseWheel != 0 && mouseInView) cam.dist *= (io.MouseWheel > 0) ? 0.9f : 1.1f;
             cam.dist = std::max(cam.dist, 0.01f);
         }
 
         // ---- matriks ----
-        int fbw, fbh; glfwGetFramebufferSize(win, &fbw, &fbh);
-        float aspect = fbh > 0 ? (float)fbw / fbh : 1.0f;
+        float aspect = (float)vpw / (float)vph;
         float nearP = std::max(cam.dist * 0.01f, 0.001f);
         const float fov = glm::radians(45.0f);
         glm::mat4 view = cam.view();
@@ -791,11 +1283,26 @@ int main(int argc, char** argv) {
         glm::mat4 mvp = proj * view;
 
         auto pickAt = [&](glm::vec2 m) -> Hit {
-            glm::vec4 vp(0, 0, (float)fbw, (float)fbh);
+            glm::vec4 vp((float)vpx, (float)vpy, (float)vpw, (float)vph);
             glm::vec3 a = glm::unProject(glm::vec3(m.x, fbh - m.y, 0.0f), view, proj, vp);
             glm::vec3 b = glm::unProject(glm::vec3(m.x, fbh - m.y, 1.0f), view, proj, vp);
             return raycast(mesh, a, glm::normalize(b - a));
         };
+
+        // ---- shortcut ----
+        if (!io.WantTextInput) {
+            if (io.KeyCtrl) {
+                if (ImGui::IsKeyPressed(ImGuiKey_Z)) { if (io.KeyShift) canvas.redo(); else canvas.undo(); }
+                if (ImGui::IsKeyPressed(ImGuiKey_Y)) canvas.redo();
+                if (ImGui::IsKeyPressed(ImGuiKey_O, false)) tryLoad(openFileDialog());
+            } else {
+                if (ImGui::IsKeyPressed(ImGuiKey_E, false)) eraser = !eraser;
+                if (ImGui::IsKeyPressed(ImGuiKey_X, false)) symmetry = !symmetry;
+                if (ImGui::IsKeyPressed(ImGuiKey_F, false) && mesh.vao) cam.fit(mesh.bmin, mesh.bmax);
+                if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket)) brushSizePct = std::max(0.2f, brushSizePct * 0.85f);
+                if (ImGui::IsKeyPressed(ImGuiKey_RightBracket)) brushSizePct = std::min(30.0f, brushSizePct * 1.18f);
+            }
+        }
 
         // ---- painting ----
         float modelRadius = glm::length(mesh.bmax - mesh.bmin) * 0.5f;
@@ -803,15 +1310,15 @@ int main(int argc, char** argv) {
         bool anyChannel = chColor || chRough || chMetal;
         bool canPaint = paintMode && mesh.vao && mesh.hasUV && !io.KeyAlt && !io.KeyShift
                         && anyChannel && !canvas.layers.empty() && canvas.layers[canvas.active].visible;
-        bool mouseOk = ImGui::IsMousePosValid() && !io.WantCaptureMouse;
-        glm::vec2 mp(io.MousePos.x * io.DisplayFramebufferScale.x, io.MousePos.y * io.DisplayFramebufferScale.y);
+        bool mouseOk = mouseInView && !io.WantCaptureMouse;
+        glm::vec2 mp(io.MousePos.x * sx, io.MousePos.y * sy);
 
         float distRef = cam.dist;
         if (canPaint && mouseOk) {
             Hit hv = pickAt(mp);
             if (hv.ok) distRef = glm::length(hv.p - cam.eye());
         }
-        float brushPx = radiusWorld * (fbh * 0.5f) / (std::max(distRef, 1e-4f) * std::tan(fov * 0.5f));
+        float brushPx = radiusWorld * ((float)vph * 0.5f) / (std::max(distRef, 1e-4f) * std::tan(fov * 0.5f));
 
         auto paintStamp = [&](const glm::vec3& p, const glm::vec3& n) {
             if (!strokeSnap) { canvas.pushUndo(); strokeSnap = true; }
@@ -819,9 +1326,8 @@ int main(int argc, char** argv) {
             glViewport(0, 0, canvas.size, canvas.size);
             glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE);
             glEnable(GL_BLEND);
-            if (eraser) glBlendFunc(GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);   // hapus -> transparan
-            else glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);           // premultiplied
-            // hanya kanal yang dicentang yang tertulis
+            if (eraser) glBlendFunc(GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);
+            else glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
             glColorMaski(0, (GLboolean)chColor, (GLboolean)chColor, (GLboolean)chColor, (GLboolean)chColor);
             glColorMaski(1, (GLboolean)chRough, (GLboolean)chRough, (GLboolean)chMetal, (GLboolean)chMetal);
             glUseProgram(paintProg);
@@ -868,42 +1374,158 @@ int main(int argc, char** argv) {
             } else { stroke = false; canvas.dirty = true; }
         }
 
-        // ---- shortcut undo/redo ----
-        if (!io.WantTextInput && io.KeyCtrl) {
-            if (ImGui::IsKeyPressed(ImGuiKey_Z)) { if (io.KeyShift) canvas.redo(); else canvas.undo(); }
-            if (ImGui::IsKeyPressed(ImGuiKey_Y)) canvas.redo();
-        }
-
-        // ---- cursor brush ----
         if (canPaint && mouseOk) {
-            ImGui::GetForegroundDrawList()->AddCircle(io.MousePos, brushPx / io.DisplayFramebufferScale.x,
+            ImGui::GetForegroundDrawList()->AddCircle(io.MousePos, brushPx / sx,
                 IM_COL32(255, 255, 255, 220), 48, 1.5f);
         }
 
-        // ---- UI ----
-        ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-        ImGui::Begin("LitePainter");
-        if (ImGui::Button("Open OBJ...")) tryLoad(openFileDialog());
-        ImGui::TextWrapped("%s", status.c_str());
-        if (mesh.vao) ImGui::Text("Triangles: %d", mesh.triangles);
+        // ================= UI =================
+        // ---- menu bar ----
+        if (ImGui::BeginMainMenuBar()) {
+            if (ImGui::BeginMenu("File")) {
+                if (ImGui::MenuItem("Open OBJ...", "Ctrl+O")) tryLoad(openFileDialog());
+                if (ImGui::MenuItem("Export PNG...")) doExport();
+                ImGui::Separator();
+                if (ImGui::MenuItem("Keluar")) glfwSetWindowShouldClose(win, GLFW_TRUE);
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Edit")) {
+                if (ImGui::MenuItem("Undo", "Ctrl+Z")) canvas.undo();
+                if (ImGui::MenuItem("Redo", "Ctrl+Y")) canvas.redo();
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("View")) {
+                ImGui::MenuItem("Grid", nullptr, &showGrid);
+                ImGui::MenuItem("Wireframe", nullptr, &wire);
+                if (ImGui::MenuItem("Reset kamera", "F") && mesh.vao) cam.fit(mesh.bmin, mesh.bmax);
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Bantuan")) {
+                ImGui::TextUnformatted("Klik kiri       : cat");
+                ImGui::TextUnformatted("Alt + Kiri      : orbit");
+                ImGui::TextUnformatted("Kanan/Tengah    : pan");
+                ImGui::TextUnformatted("Shift + Kiri    : pan");
+                ImGui::TextUnformatted("Scroll          : zoom");
+                ImGui::TextUnformatted("[ ]             : ukuran brush");
+                ImGui::TextUnformatted("E / X / F       : eraser / symmetry / frame");
+                ImGui::TextUnformatted("Ctrl+Z / Ctrl+Y : undo / redo");
+                ImGui::EndMenu();
+            }
+            ImGui::EndMainMenuBar();
+        }
 
-        ImGui::SeparatorText("Brush");
-        ImGui::Checkbox("Mode Paint (Alt+Kiri = orbit)", &paintMode);
-        ImGui::Text("Kanal:");
-        ImGui::SameLine(); ImGui::Checkbox("Color", &chColor);
-        ImGui::SameLine(); ImGui::Checkbox("Rough", &chRough);
-        ImGui::SameLine(); ImGui::Checkbox("Metal", &chMetal);
-        if (!anyChannel) ImGui::TextColored(ImVec4(1, 0.6f, 0.2f, 1), "Pilih minimal 1 kanal.");
-        ImGui::ColorEdit3("Warna", brushColor);
-        ImGui::SliderFloat("Roughness", &valRough, 0.0f, 1.0f);
-        ImGui::SliderFloat("Metallic", &valMetal, 0.0f, 1.0f);
-        ImGui::SliderFloat("Ukuran (%)", &brushSizePct, 0.2f, 30.0f);
-        ImGui::SliderFloat("Hardness", &hardness, 0.0f, 0.99f);
-        ImGui::SliderFloat("Opacity", &opacity, 0.05f, 1.0f);
-        ImGui::Checkbox("Eraser", &eraser);
-        ImGui::SameLine();
-        ImGui::Checkbox("Symmetry X", &symmetry);
+        // ---- panel kiri (tab) ----
+        ImGui::SetNextWindowPos(ImVec2(0, menuH));
+        ImGui::SetNextWindowSize(ImVec2(leftW, winH - menuH - statusH));
+        ImGui::Begin("##left", nullptr, panelFlags);
+        ImGui::PushItemWidth(leftW * 0.50f);
+        if (ImGui::BeginTabBar("##tabs")) {
+            // ------------------------------------------------ Paint
+            if (ImGui::BeginTabItem("Paint")) {
+                ImGui::SeparatorText("Mode");
+                ImGui::Checkbox("Mode Paint", &paintMode);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Aktif: klik kiri = cat, Alt+Kiri = orbit");
+                ImGui::SeparatorText("Kanal yang dicat");
+                float sp = ImGui::GetStyle().ItemSpacing.x;
+                float bw = (ImGui::GetContentRegionAvail().x - sp * 2.0f) / 3.0f;
+                toggleBtn("Color", &chColor, bw); ImGui::SameLine();
+                toggleBtn("Rough", &chRough, bw); ImGui::SameLine();
+                toggleBtn("Metal", &chMetal, bw);
+                if (!anyChannel) ImGui::TextColored(ImVec4(1, 0.6f, 0.2f, 1), "Pilih minimal 1 kanal.");
+                ImGui::SeparatorText("Nilai");
+                if (chColor) ImGui::ColorEdit3("Warna", brushColor, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_PickerHueWheel);
+                if (chRough) ImGui::SliderFloat("Roughness", &valRough, 0.0f, 1.0f, "%.2f");
+                if (chMetal) ImGui::SliderFloat("Metallic", &valMetal, 0.0f, 1.0f, "%.2f");
+                ImGui::SeparatorText("Brush");
+                ImGui::SliderFloat("Ukuran", &brushSizePct, 0.2f, 30.0f, "%.1f %%");
+                ImGui::SliderFloat("Hardness", &hardness, 0.0f, 0.99f, "%.2f");
+                ImGui::SliderFloat("Opacity", &opacity, 0.05f, 1.0f, "%.2f");
+                float bw2 = (ImGui::GetContentRegionAvail().x - sp) / 2.0f;
+                toggleBtn("Eraser (E)", &eraser, bw2); ImGui::SameLine();
+                toggleBtn("Symmetry X (X)", &symmetry, bw2);
+                ImGui::EndTabItem();
+            }
+            // ------------------------------------------------ Bake
+            if (ImGui::BeginTabItem("Bake")) {
+                bool running = job.running.load();
+                bool canBake = mesh.vao && mesh.hasUV && !running;
+                ImGui::SeparatorText("Map");
+                ImGui::Checkbox("Ambient Occlusion", &bp.ao);
+                ImGui::Checkbox("Curvature", &bp.curv);
+                if (bp.ao) {
+                    ImGui::SeparatorText("Pengaturan AO");
+                    ImGui::Combo("Kualitas", &bakeQ, qualNames, 3);
+                    ImGui::SliderFloat("Jarak", &bp.distPct, 2.0f, 100.0f, "%.0f %%");
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Jarak maksimum penghalang, relatif ke ukuran model");
+                    ImGui::SliderFloat("Kontras", &bp.power, 0.5f, 3.0f, "%.2f");
+                    ImGui::Checkbox("Balik normal", &bp.flip);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Centang jika hasil AO terlihat terbalik/hitam semua");
+                }
+                if (bp.curv) {
+                    ImGui::SeparatorText("Pengaturan Curvature");
+                    ImGui::SliderInt("Radius", &bp.curvRadius, 1, 8, "%d px");
+                    ImGui::SliderFloat("Kekuatan", &bp.curvStrength, 0.2f, 10.0f, "%.1f");
+                }
+                ImGui::Spacing();
+                ImGui::TextDisabled("Resolusi bake = resolusi texture (%d px)", canvas.size);
+                if (!mesh.vao) ImGui::TextColored(ImVec4(1, 0.6f, 0.2f, 1), "Load model dulu.");
+                else if (!mesh.hasUV) ImGui::TextColored(ImVec4(1, 0.6f, 0.2f, 1), "Model tidak punya UV.");
+                if (!canBake) ImGui::BeginDisabled();
+                if (ImGui::Button("Bake", ImVec2(-1, 34))) startBake();
+                if (!canBake) ImGui::EndDisabled();
+                if (running) {
+                    int st = job.stage.load();
+                    const char* stName = st == 0 ? "Membangun BVH..." : (st == 1 ? "Menghitung AO..." : (st == 2 ? "Menghitung curvature..." : "Padding seam..."));
+                    float frac = st == 1 ? (float)job.rowsDone.load() / (float)std::max(1, job.size) : (st == 0 ? 0.0f : 1.0f);
+                    ImGui::ProgressBar(frac, ImVec2(-1, 0), stName);
+                    if (ImGui::Button("Batal", ImVec2(-1, 0))) job.cancel = true;
+                }
+                ImGui::SeparatorText("Hasil");
+                if (!bakeMaps.hasAO && !bakeMaps.hasCurv) ImGui::TextDisabled("Belum ada hasil bake.");
+                if (bakeMaps.hasAO) {
+                    ImGui::Text("AO: siap (%d px)", bakeMaps.size);
+                    if (ImGui::Button("AO -> Layer (Multiply)", ImVec2(-1, 0))) bakeToLayer(bakeMaps.aoPx, 1, 1.0f, "AO");
+                }
+                if (bakeMaps.hasCurv) {
+                    ImGui::Text("Curvature: siap (%d px)", bakeMaps.size);
+                    if (ImGui::Button("Curvature -> Layer (Overlay)", ImVec2(-1, 0))) bakeToLayer(bakeMaps.curvPx, 3, 0.5f, "Curvature");
+                }
+                if (bakeMaps.hasAO || bakeMaps.hasCurv) {
+                    ImGui::Checkbox("Pakai AO di preview", &useAO);
+                    if (ImGui::Button("Hapus hasil bake", ImVec2(-1, 0))) bakeMaps.clear();
+                }
+                ImGui::EndTabItem();
+            }
+            // ------------------------------------------------ Texture / Export
+            if (ImGui::BeginTabItem("Texture")) {
+                ImGui::SeparatorText("Resolusi");
+                if (ImGui::Combo("Ukuran", &sizeIdx, sizeNames, 3)) {
+                    bakeStop();
+                    bakeMaps.clear();
+                    canvas.create(sizeVals[sizeIdx]);
+                    canvas.buildMask(mesh);
+                }
+                ImGui::TextDisabled("Ganti resolusi = reset layer & hasil bake");
+                ImGui::SeparatorText("Nilai dasar (latar)");
+                if (ImGui::ColorEdit3("Color", baseColor, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_PickerHueWheel)) canvas.dirty = true;
+                if (ImGui::SliderFloat("Roughness", &baseRough, 0.0f, 1.0f, "%.2f")) canvas.dirty = true;
+                if (ImGui::SliderFloat("Metallic", &baseMetal, 0.0f, 1.0f, "%.2f")) canvas.dirty = true;
+                ImGui::SeparatorText("Export");
+                ImGui::Checkbox("Sertakan ORM (glTF)", &exportORM);
+                ImGui::Checkbox("Sertakan AO & Curvature (bake)", &exportBake);
+                if (ImGui::Button("Export PNG...", ImVec2(-1, 32))) doExport();
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
+        ImGui::PopItemWidth();
+        ImGui::End();
 
+        // ---- panel kanan: layer + preview ----
+        ImGui::SetNextWindowPos(ImVec2(winW - rightW, menuH));
+        ImGui::SetNextWindowSize(ImVec2(rightW, winH - menuH - statusH));
+        ImGui::Begin("##right", nullptr, panelFlags);
+        ImGui::PushItemWidth(rightW * 0.48f);
         ImGui::SeparatorText("Layer");
         for (int i = (int)canvas.layers.size() - 1; i >= 0; i--) {
             Layer& L = canvas.layers[i];
@@ -915,91 +1537,80 @@ int main(int argc, char** argv) {
         }
         {
             Layer& A = canvas.layers[canvas.active];
-            if (ImGui::SliderFloat("Opacity layer", &A.opacity, 0.0f, 1.0f)) canvas.dirty = true;
-            if (ImGui::Combo("Blend (Color)", &A.blend, blendNames, 5)) canvas.dirty = true;
+            if (ImGui::SliderFloat("Opacity", &A.opacity, 0.0f, 1.0f, "%.2f")) canvas.dirty = true;
+            if (ImGui::Combo("Blend", &A.blend, blendNames, 5)) canvas.dirty = true;
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Blend mode berlaku untuk kanal Color");
         }
-        if (ImGui::Button("Add")) canvas.addLayer();
-        ImGui::SameLine();
-        if (ImGui::Button("Delete")) canvas.deleteActive();
-        ImGui::SameLine();
-        if (ImGui::Button("Naik")) canvas.moveActive(+1);
-        ImGui::SameLine();
-        if (ImGui::Button("Turun")) canvas.moveActive(-1);
-        if (ImGui::Button("Fill layer")) {
-            canvas.pushUndo();
-            const float col[4] = {brushColor[0], brushColor[1], brushColor[2], 1.0f};
-            const float pbr[4] = {valRough, 1.0f, valMetal, 1.0f};
-            canvas.clearChannels(canvas.layers[canvas.active], chColor, chRough, chMetal, col, pbr);
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Clear layer")) {
-            canvas.pushUndo();
-            const float z[4] = {0, 0, 0, 0};
-            canvas.clearChannels(canvas.layers[canvas.active], chColor, chRough, chMetal, z, z);
-        }
-        ImGui::TextDisabled("Fill/Clear hanya untuk kanal yang dicentang");
-
-        ImGui::SeparatorText("Texture");
-        if (ImGui::Combo("Resolusi", &sizeIdx, sizeNames, 3)) {
-            canvas.create(sizeVals[sizeIdx]);
-            canvas.buildMask(mesh);
-        }
-        ImGui::TextDisabled("(ganti resolusi = reset semua layer)");
-        if (ImGui::ColorEdit3("Color dasar", baseColor)) canvas.dirty = true;
-        if (ImGui::SliderFloat("Roughness dasar", &baseRough, 0.0f, 1.0f)) canvas.dirty = true;
-        if (ImGui::SliderFloat("Metallic dasar", &baseMetal, 0.0f, 1.0f)) canvas.dirty = true;
-        if (ImGui::Button("Undo")) canvas.undo();
-        ImGui::SameLine();
-        if (ImGui::Button("Redo")) canvas.redo();
-        ImGui::SameLine();
-        ImGui::TextDisabled("(%d)", (int)canvas.undoS.size());
-
-        ImGui::Checkbox("Sertakan ORM (glTF)", &exportORM);
-        if (ImGui::Button("Export PNG...")) {
-            std::string path = saveFileDialog();
-            if (!path.empty()) {
-                canvas.compose(baseColor, baseRough, baseMetal, true);
-                undilated = false;
-                std::vector<unsigned char> rgb, rough, metal;
-                canvas.readFinal(rgb, rough, metal);
-                std::string stem = stripPng(path);
-                int sz = canvas.size;
-                stbi_flip_vertically_on_write(1);
-                bool ok = stbi_write_png((stem + "_BaseColor.png").c_str(), sz, sz, 3, rgb.data(), sz * 3) != 0;
-                ok = ok && stbi_write_png((stem + "_Roughness.png").c_str(), sz, sz, 1, rough.data(), sz) != 0;
-                ok = ok && stbi_write_png((stem + "_Metallic.png").c_str(), sz, sz, 1, metal.data(), sz) != 0;
-                if (ok && exportORM) {
-                    std::vector<unsigned char> orm((size_t)sz * sz * 3);
-                    for (size_t i = 0; i < (size_t)sz * sz; i++) { orm[3 * i] = 255; orm[3 * i + 1] = rough[i]; orm[3 * i + 2] = metal[i]; }
-                    ok = stbi_write_png((stem + "_ORM.png").c_str(), sz, sz, 3, orm.data(), sz * 3) != 0;
-                }
-                status = ok ? ("Tersimpan: " + stem + "_BaseColor / _Roughness / _Metallic" + (exportORM ? " / _ORM" : "") + ".png")
-                            : "Gagal menyimpan PNG.";
+        {
+            float sp = ImGui::GetStyle().ItemSpacing.x;
+            float w4 = (ImGui::GetContentRegionAvail().x - sp * 3.0f) / 4.0f;
+            if (ImGui::Button("Add", ImVec2(w4, 0))) canvas.addLayer();
+            ImGui::SameLine();
+            if (ImGui::Button("Del", ImVec2(w4, 0))) canvas.deleteActive();
+            ImGui::SameLine();
+            if (ImGui::Button("Up", ImVec2(w4, 0))) canvas.moveActive(+1);
+            ImGui::SameLine();
+            if (ImGui::Button("Down", ImVec2(w4, 0))) canvas.moveActive(-1);
+            float w2 = (ImGui::GetContentRegionAvail().x - sp) / 2.0f;
+            if (ImGui::Button("Fill", ImVec2(w2, 0))) {
+                canvas.pushUndo();
+                const float col[4] = {brushColor[0], brushColor[1], brushColor[2], 1.0f};
+                const float pbr[4] = {valRough, 1.0f, valMetal, 1.0f};
+                canvas.clearChannels(canvas.layers[canvas.active], chColor, chRough, chMetal, col, pbr);
             }
+            ImGui::SameLine();
+            if (ImGui::Button("Clear", ImVec2(w2, 0))) {
+                canvas.pushUndo();
+                const float z[4] = {0, 0, 0, 0};
+                canvas.clearChannels(canvas.layers[canvas.active], chColor, chRough, chMetal, z, z);
+            }
+            ImGui::TextDisabled("Fill/Clear: kanal yang aktif saja");
+            if (ImGui::Button("Undo", ImVec2(w2, 0))) canvas.undo();
+            ImGui::SameLine();
+            if (ImGui::Button("Redo", ImVec2(w2, 0))) canvas.redo();
         }
-
-        ImGui::SeparatorText("View");
-        ImGui::Combo("Preview", &viewMode, viewNames, 4);
+        ImGui::SeparatorText("Preview");
+        ImGui::Combo("Mode", &viewMode, viewNames, 6);
+        if ((viewMode == 4 && !bakeMaps.hasAO) || (viewMode == 5 && !bakeMaps.hasCurv))
+            ImGui::TextColored(ImVec4(1, 0.6f, 0.2f, 1), "Belum di-bake (tab Bake).");
         ImGui::Checkbox("Wireframe", &wire);
-        ImGui::SameLine();
         ImGui::Checkbox("Grid", &showGrid);
         ImGui::Checkbox("Grid di dasar model", &gridAtBase);
-        if (ImGui::Button("Reset kamera") && mesh.vao) cam.fit(mesh.bmin, mesh.bmax);
-        ImGui::TextDisabled("Kanan/Tengah/Shift+Kiri: pan | Scroll: zoom | Ctrl+Z/Y");
+        if (ImGui::Button("Reset kamera (F)", ImVec2(-1, 0)) && mesh.vao) cam.fit(mesh.bmin, mesh.bmax);
+        ImGui::PopItemWidth();
         ImGui::End();
 
-        // ---- komposit layer (padding hanya saat tidak sedang melukis) ----
+        // ---- status bar ----
+        ImGui::SetNextWindowPos(ImVec2(0, winH - statusH));
+        ImGui::SetNextWindowSize(ImVec2(winW, statusH));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12, 6));
+        ImGui::Begin("##status", nullptr, panelFlags | ImGuiWindowFlags_NoScrollbar);
+        {
+            std::string line = status;
+            size_t nl = line.find('\n');
+            if (nl != std::string::npos) line = line.substr(0, nl);
+            ImGui::TextUnformatted(line.c_str());
+            char info[128];
+            std::snprintf(info, sizeof(info), "%d tris | %d px | %.0f FPS", mesh.triangles, canvas.size, io.Framerate);
+            ImGui::SameLine(winW - ImGui::CalcTextSize(info).x - 16.0f);
+            ImGui::TextDisabled("%s", info);
+        }
+        ImGui::End();
+        ImGui::PopStyleVar();
+
+        // ---- komposit layer ----
         bool busy = stroke || ImGui::IsAnyItemActive();
         if (canvas.dirty) { canvas.compose(baseColor, baseRough, baseMetal, !busy); undilated = busy; }
         else if (undilated && !busy) { canvas.compose(baseColor, baseRough, baseMetal, true); undilated = false; }
 
-        // ---- render ----
+        // ---- render 3D (di area tengah) ----
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glViewport(0, 0, fbw, fbh);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-        glDisable(GL_BLEND);
+        glDisable(GL_BLEND); glDisable(GL_SCISSOR_TEST);
         glClearColor(0.16f, 0.17f, 0.19f, 1);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glViewport(vpx, vpy, vpw, vph);
         glEnable(GL_DEPTH_TEST);
 
         if (showGrid) {
@@ -1024,10 +1635,15 @@ int main(int argc, char** argv) {
             glUniform3fv(glGetUniformLocation(meshProg, "uEye"), 1, glm::value_ptr(eye));
             glUniform3fv(glGetUniformLocation(meshProg, "uLight"), 1, glm::value_ptr(light));
             glUniform1i(glGetUniformLocation(meshProg, "uView"), viewMode);
+            glUniform1i(glGetUniformLocation(meshProg, "uUseAO"), (useAO && bakeMaps.hasAO && bakeMaps.size > 0) ? 1 : 0);
             glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, canvas.dispC);
             glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, canvas.dispP);
+            glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, bakeMaps.hasAO ? bakeMaps.ao : dummyWhite);
+            glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, bakeMaps.hasCurv ? bakeMaps.curv : dummyGray);
             glUniform1i(glGetUniformLocation(meshProg, "uTex"), 0);
             glUniform1i(glGetUniformLocation(meshProg, "uTexP"), 1);
+            glUniform1i(glGetUniformLocation(meshProg, "uTexAO"), 2);
+            glUniform1i(glGetUniformLocation(meshProg, "uTexCv"), 3);
             glPolygonMode(GL_FRONT_AND_BACK, wire ? GL_LINE : GL_FILL);
             mesh.draw();
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
@@ -1035,11 +1651,13 @@ int main(int argc, char** argv) {
         }
 
         ImGui::Render();
+        glViewport(0, 0, fbw, fbh);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(win);
     }
 
-    mesh.destroy(); canvas.destroy();
+    bakeStop();
+    mesh.destroy(); canvas.destroy(); bakeMaps.clear();
     ImGui_ImplOpenGL3_Shutdown(); ImGui_ImplGlfw_Shutdown(); ImGui::DestroyContext();
     glfwDestroyWindow(win); glfwTerminate();
     return 0;
